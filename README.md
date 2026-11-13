@@ -2,7 +2,7 @@
 
 Watches for the scooter over Bluetooth. Each time it shows up, the script reads the odometer and logs the distance ridden since the last reading.
 
-The encrypted Bluetooth protocol code in `ninebot_v2/` is vendored unmodified from [ha-ninebot](https://github.com/BobMcGlobus/ha-ninebot) (AGPL-3.0, see `ninebot_v2/SOURCE.txt`).
+The encrypted Bluetooth protocol code in `ninebot_v2/` is vendored unmodified from [ha-ninebot](https://github.com/BobMcGlobus/ha-ninebot) (see `ninebot_v2/SOURCE.txt` and `ninebot_v2/NOTICE`). Because it includes that code, this project is licensed under the GNU AGPL-3.0 as well; see `LICENSE`.
 
 ## Setup
 
