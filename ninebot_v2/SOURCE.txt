@@ -1,0 +1,3 @@
+Vendored unmodified from https://github.com/BobMcGlobus/ha-ninebot
+(custom_components/ninebot_scooter/ninebot_ble/, commit 45e4f4dcd6647bf3048b7fed8cae3452e4e34438).
+Licensed AGPL-3.0, see LICENSE and NOTICE.

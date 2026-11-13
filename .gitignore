@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.db
+state.json
+*.plist
+.DS_Store

@@ -1,0 +1,1273 @@
+"""Encryption2 client for newer Segway-Ninebot vehicles (Max G3, G2, E-series).
+
+Protocol documentation: https://codeberg.org/NootNooot/segway-ninebot-ble (MIT).
+
+These vehicles expose their own GATT service and speak an AES-encrypted protocol
+behind a three-phase handshake. Confusingly they usually still advertise the
+classic Nordic UART service used by older models, but never answer on it.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+import struct
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from bleak import BleakClient
+from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.device import BLEDevice
+from bleak_retry_connector import establish_connection
+
+from .crypto_v2 import FW_DATA, NbCryptoV2
+
+_LOGGER = logging.getLogger(__name__)
+
+SERVICE_UUID = "6e400001-0000-0000-006e-696e65626f74"
+WRITE_UUID = "6e400002-0000-0000-006e-696e65626f74"
+NOTIFY_UUID = "6e400004-0000-0000-006e-696e65626f74"
+RCTP_WRITE_UUID = "6e400003-0000-0000-006e-696e65626f74"
+NORDIC_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+# Standard GATT Device Name: the vehicle's serial, which is the encryption key.
+GATT_DEVICE_NAME_UUID = "00002a00-0000-1000-8000-00805f9b34fb"
+
+NORDIC_WRITE_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+NORDIC_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+SYNC1 = 0x5A
+BT_ID = 0x3E
+
+# The two generations differ in more than the keystream: the second sync byte and
+# the preferred GATT service change too. Sending a frame with the wrong sync byte
+# is invisible - the vehicle's parser never recognises a frame and stays silent.
+GEN2 = "gen2"  # 0x5AA5, fw_data keystream, Nordic UART - E125S and older
+GEN3 = "gen3"  # 0x5AB5, zero keystream, Ninebot Custom - newer models
+
+GENERATIONS: dict[str, dict[str, Any]] = {
+    GEN3: {
+        "sync2": 0xB5,
+        "gen2_keystream": False,
+        "write": WRITE_UUID,
+        "notify": NOTIFY_UUID,
+    },
+    GEN2: {
+        "sync2": 0xA5,
+        "gen2_keystream": True,
+        "write": NORDIC_WRITE_UUID,
+        "notify": NORDIC_NOTIFY_UUID,
+    },
+}
+VALID_SYNC2 = {0xA5, 0xB5}
+
+# Boards
+BOARD_DIS = 0x01  # dashboard on E-series; proxies values from sleeping boards
+BOARD_VCU = 0x16  # vehicle control unit; where kick scooters keep their data
+BOARD_BLE = 0x04
+# The Bluetooth board under the classic protocol's numbering. An E2 Plus speaks
+# the newer protocol but addresses its handshake here: a capture of the app shows
+# PRE_COMM going to 0x21, and our frame matches the app's byte for byte only with
+# that destination (#17). Sent to 0x04 it is ignored without a reply.
+BOARD_BLE_CLASSIC = 0x21
+
+# Commands
+CMD_READ = 0x01
+CMD_WRITE = 0x02         # write and wait for an acknowledgement (reply 0x05)
+CMD_WRITE_NO_REPLY = 0x03  # write with no reply
+CMD_READ_RESP = 0x04
+CMD_WRITE_RESP = 0x05
+CMD_PRE_COMM = 0x5B
+CMD_SET_PWD = 0x5C
+CMD_AUTH = 0x5D
+
+
+
+@dataclass(frozen=True)
+class Frame:
+    """A decoded plaintext frame."""
+
+    target: int
+    command: int
+    index: int
+    payload: bytes
+
+
+def build_frame(
+    target: int, command: int, index: int, payload: bytes = b"", sync2: int = 0xA5
+) -> bytes:
+    """Assemble a plaintext frame for the given generation."""
+    return bytes([SYNC1, sync2, len(payload), BT_ID, target, command, index]) + payload
+
+
+def parse_frame(plaintext: bytes) -> Frame | None:
+    """Decode a plaintext reply, or None if it is malformed.
+
+    Replies carry the source board where requests carry the protocol id, so the
+    two fields are swapped compared to :func:`build_frame`.
+    """
+    if len(plaintext) < 7 or plaintext[0] != SYNC1 or plaintext[1] not in VALID_SYNC2:
+        return None
+    length = plaintext[2]
+    return Frame(
+        target=plaintext[3],
+        command=plaintext[5],
+        index=plaintext[6],
+        payload=plaintext[7 : 7 + length],
+    )
+
+
+
+def _loggable(plaintext: bytes) -> str:
+    """Hex of an outgoing frame, with the pairing password hidden.
+
+    SET_PWD carries the password in clear before encryption, and debug logs end
+    up attached to public issues. One did, with the password in it.
+    """
+    if len(plaintext) > 7 and plaintext[5] == CMD_SET_PWD:
+        return f"{plaintext[:7].hex().upper()}<{len(plaintext) - 7} bytes redacted>"
+    return plaintext.hex().upper()
+
+
+def _link_mtu(client: BleakClient) -> int | None:
+    """The ATT MTU the link negotiated, or None if the stack does not know it.
+
+    AUTH and SET_PWD are 27 and 29 bytes. A link left at the minimum MTU of 23
+    carries 20 bytes per write, so those two go out in pieces - the first thing
+    to know when they go unanswered while the 13-byte PRE_COMM works.
+
+    A Bluetooth proxy reports the value it negotiated. BlueZ reports 23 as a
+    placeholder until the MTU is acquired, and warns while doing it; that
+    warning is how a placeholder is told apart from a real 23, without reaching
+    into any backend's private state.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            mtu = int(client.mtu_size)
+        except Exception:  # noqa: BLE001 - diagnostic only
+            return None
+    return None if caught else mtu
+
+
+class NinebotV2Client:
+    """Talks Encryption2 to a single vehicle."""
+
+    def __init__(
+        self,
+        password: bytes | None = None,
+        generation: str | None = None,
+        ble_board: int | None = None,
+    ) -> None:
+        self.crypto = NbCryptoV2()
+        self.client: BleakClient | None = None
+        self.gatt_services: dict[str, list[str]] = {}
+        # ATT MTU of the link, when the stack actually knows it. None means
+        # the value was a placeholder (BlueZ reports 23 until acquired).
+        self.mtu: int | None = None
+        # Session password: reused across connections so the pairing button press
+        # is only needed once.
+        self.password: bytes | None = password
+        self.serial: str | None = None
+        self._auth_param: bytes = b""
+        self._rx_buffer = bytearray()
+        self._queue: asyncio.Queue[Frame] = asyncio.Queue(32)
+        # Discovered on connect; the working combination is found by trying.
+        self._write_with_response = False
+        self._write_uuid = WRITE_UUID
+        self._sync2 = 0xA5
+        self.generation: str | None = generation
+        # Which board takes the handshake; found by trying, like the generation.
+        self.ble_board: int | None = ble_board
+        self._write_chars: list[str] = []
+        self._notify_chars: list[str] = []
+        # Replies we received but could not decrypt - see _set_password.
+        self._undecryptable = 0
+        # The last frames we sent, as they went out, to recognise echoes.
+        self._recent_tx: list[bytes] = []
+
+    @property
+    def is_connected(self) -> bool:
+        return self.client is not None and self.client.is_connected
+
+    # -- connection ------------------------------------------------------------
+
+    async def connect(
+        self,
+        device: BLEDevice,
+        pair_timeout: float = 120.0,
+        on_wait_for_button: Callable[[], None] | None = None,
+    ) -> None:
+        """Connect and run the three-phase handshake."""
+        name = device.name or ""
+        _LOGGER.debug("Connecting to %s (%s)", name, device.address)
+        self.client = await establish_connection(BleakClient, device, device.address)
+        self.mtu = _link_mtu(self.client)
+        _LOGGER.debug(
+            "Link MTU %s",
+            self.mtu if self.mtu is not None else "unknown (stack reports a placeholder)",
+        )
+
+        self.gatt_services = {
+            str(service.uuid): [str(char.uuid) for char in service.characteristics]
+            for service in self.client.services
+        }
+        # Gen2 talks over the classic Nordic UART service and need not expose
+        # Segway's own service at all - only Gen3 uses that one. Requiring it
+        # here rejected Nordic-UART-only vehicles before the handshake could even
+        # start; the generation sweep below already skips any generation whose
+        # write characteristic is missing, so accept either service and let it
+        # decide.
+        seen = {uuid.lower() for uuid in self.gatt_services}
+        if SERVICE_UUID not in seen and NORDIC_SERVICE_UUID not in seen:
+            raise TimeoutError(
+                "Vehicle exposes neither the Ninebot nor the Nordic UART service "
+                f"- it does not speak this protocol. Services seen: "
+                f"{sorted(self.gatt_services)}"
+            )
+
+        # Subscribe to every characteristic that can notify, not just the one the
+        # documentation names: if a model answers on a different channel we would
+        # otherwise see complete silence and have no way to tell.
+        self._notify_chars = []
+        self._write_chars = []
+        for service in self.client.services:
+            if str(service.uuid).lower() not in (SERVICE_UUID, NORDIC_SERVICE_UUID):
+                continue
+            for char in service.characteristics:
+                properties = set(char.properties)
+                if properties & {"notify", "indicate"}:
+                    try:
+                        await self.client.start_notify(char, self._on_notify)
+                        self._notify_chars.append(str(char.uuid))
+                    except Exception as err:  # noqa: BLE001 - best effort per channel
+                        _LOGGER.debug("Could not subscribe to %s: %s", char.uuid, err)
+                if properties & {"write", "write-without-response"}:
+                    self._write_chars.append(str(char.uuid).lower())
+                if str(char.uuid).lower() == WRITE_UUID:
+                    _LOGGER.debug(
+                        "Write characteristic properties: %s (MTU %s)",
+                        sorted(properties),
+                        getattr(self.client, "mtu_size", "unknown"),
+                    )
+        _LOGGER.debug("Listening on: %s", self._notify_chars)
+        if not self._notify_chars:
+            raise TimeoutError("Vehicle exposes no notification channel to listen on")
+        # Newer firmwares may flush cached notifications from a previous session;
+        # let them arrive and be dropped before the handshake starts.
+        await asyncio.sleep(0.2)
+        self._drain()
+
+        # The name is the encryption key, and a wrong one is rejected silently.
+        # Prefer the name the vehicle reports over GATT: the advertised name can
+        # be shortened or stale.
+        try:
+            raw_name = await self.client.read_gatt_char(GATT_DEVICE_NAME_UUID)
+            gatt_name = raw_name.decode("ascii", errors="ignore").replace("\x00", "").strip()
+            if gatt_name and gatt_name != name:
+                _LOGGER.debug("Using GATT device name %r instead of %r", gatt_name, name)
+                name = gatt_name
+        except Exception as err:  # noqa: BLE001 - advisory, the advert name may do
+            _LOGGER.debug("Could not read the GATT device name: %s", err)
+
+        await self._handshake(name, pair_timeout, on_wait_for_button)
+
+    async def disconnect(self) -> None:
+        if self.client and self.client.is_connected:
+            for uuid in self._notify_chars:
+                try:
+                    await self.client.stop_notify(uuid)
+                except Exception:  # noqa: BLE001 - best effort on teardown
+                    pass
+            await self.client.disconnect()
+        self.client = None
+
+    # -- handshake -------------------------------------------------------------
+
+    async def _handshake(
+        self,
+        name: str,
+        pair_timeout: float,
+        on_wait_for_button: Callable[[], None] | None,
+    ) -> None:
+        # Phase 1 - PRE_COMM: ask for the challenge and serial, keyed on the
+        # advertised device name, in non-SN mode.
+        #
+        # A vehicle answers only when the sync byte, the keystream and the GATT
+        # channel all match its generation. Every wrong combination fails the same
+        # silent way, so try the real ones rather than mixing them.
+        response = None
+        candidates = (self.generation,) if self.generation else (GEN3, GEN2)
+        boards = (self.ble_board,) if self.ble_board else (BOARD_BLE, BOARD_BLE_CLASSIC)
+        attempts = [
+            (with_response, board) for with_response in (False, True) for board in boards
+        ]
+        for gen in candidates:
+            spec = GENERATIONS[gen]
+            if spec["write"] not in self._write_chars:
+                _LOGGER.debug("Skipping %s: no %s characteristic", gen, spec["write"][:8])
+                continue
+            for with_response, board in attempts:
+                self._sync2 = spec["sync2"]
+                self._write_uuid = spec["write"]
+                self._write_with_response = with_response
+                self.crypto = NbCryptoV2(gen2=spec["gen2_keystream"])
+                self.crypto.reset_sn()
+                # On Gen2 the constant is both the static keystream block and the
+                # second half of the key material; Gen3 uses zeros for both.
+                self.crypto.set_key(
+                    name.encode(), FW_DATA if spec["gen2_keystream"] else None
+                )
+                _LOGGER.debug(
+                    "PRE_COMM try: %s (sync 5A%02X, write %s, %s, board 0x%02X)",
+                    gen,
+                    spec["sync2"],
+                    spec["write"][:8],
+                    "with response" if with_response else "no response",
+                    board,
+                )
+                try:
+                    response = await self._request(
+                        board, CMD_PRE_COMM, 0, b"", expect=CMD_PRE_COMM, timeout=2.5
+                    )
+                except TimeoutError:
+                    continue
+                except Exception as err:  # noqa: BLE001 - a rejected write is informative
+                    _LOGGER.debug("Write failed on this combination: %s", err)
+                    continue
+                _LOGGER.info(
+                    "Handshake accepted by the vehicle as %s on board 0x%02X", gen, board
+                )
+                self.generation = gen
+                self.ble_board = board
+                break
+            if response is not None:
+                break
+
+        if response is None:
+            raise TimeoutError(
+                "Vehicle never answered the handshake on any protocol generation "
+                "(tried 5AA5 over Nordic UART and 5AB5 over the Ninebot service, "
+                "addressed to board 0x04 and 0x21, with and without write "
+                "acknowledgement). Make sure it is switched "
+                "on and that the official Segway-Ninebot app is not connected"
+            )
+
+        if len(response.payload) < 30:
+            raise TimeoutError(
+                f"Short PRE_COMM response ({len(response.payload)} bytes) - "
+                "cannot read the authentication parameters"
+            )
+
+        self._auth_param = response.payload[0:16]
+        self.serial = response.payload[16:30].decode(errors="replace").strip("\x00")
+        has_stored_password = response.index != 0
+        _LOGGER.debug(
+            "PRE_COMM ok, serial %s, device reports stored password: %s",
+            self.serial,
+            has_stored_password,
+        )
+        if has_stored_password and not self.password:
+            _LOGGER.info(
+                "%s is already paired with another client (typically the official "
+                "app). Registering Home Assistant needs the power button pressed.",
+                self.serial,
+            )
+
+        self.crypto.set_auth(self._auth_param)
+        self.crypto.start_sn()
+        # Anything still in flight was encrypted with the previous key, so it can
+        # only decrypt to noise from here on. Drop it rather than warn about it.
+        self._rx_buffer.clear()
+        self._drain()
+
+        # Phase 2 - SET_PWD, unless we can reuse a password from a previous
+        # session (which avoids asking the user for a button press again).
+        if not (self.password and has_stored_password):
+            self.crypto.set_key(name.encode(), self._auth_param)
+            await self._set_password(
+                pair_timeout, on_wait_for_button, has_stored_password
+            )
+
+        # Phase 3 - AUTH, keyed on the session password.
+        assert self.password is not None
+        payload = (self.serial or "").encode().ljust(14, b"\x00")[:14]
+        self.crypto.set_key(self.password, self._auth_param)
+        try:
+            auth = await self._request(
+                self.ble_board, CMD_AUTH, 0, payload, expect=CMD_AUTH, timeout=4
+            )
+        except TimeoutError:
+            # Some models will not answer AUTH until the password has been
+            # asserted in this session, even when PRE_COMM already reported one
+            # stored. A decrypted capture of the official app on an E110SE shows
+            # it plainly: three AUTH attempts ignored, then SET_PWD, then the
+            # very next AUTH answered. The app sends SET_PWD unconditionally, so
+            # "stored password: True" is not the signal we took it for.
+            #
+            # Re-assert the same password we already hold and try once more.
+            # Doing this only after AUTH has failed matters: on a vehicle that
+            # answers straight away nothing is written, and a password that is
+            # merely wrong cannot quietly replace a working one on the first
+            # poll.
+            _LOGGER.debug("AUTH unanswered; re-asserting the password and retrying")
+            try:
+                # The app's capture of an E110SE has the vehicle acknowledge
+                # SET_PWD about 3.5 s after it was sent (#7), too close to 4.
+                await self._request(
+                    self.ble_board,
+                    CMD_SET_PWD,
+                    0,
+                    self.password,
+                    expect=CMD_SET_PWD,
+                    timeout=8,
+                )
+            except TimeoutError:
+                _LOGGER.debug("SET_PWD not acknowledged either; continuing anyway")
+            self.crypto.set_key(self.password, self._auth_param)
+            try:
+                auth = await self._request(
+                    self.ble_board, CMD_AUTH, 0, payload, expect=CMD_AUTH, timeout=4
+                )
+            except TimeoutError:
+                # SET_PWD is the larger of the two at 29 bytes, so that is the bar.
+                if self.mtu is not None and self.mtu - 3 < 29:
+                    raise TimeoutError(
+                        f"Vehicle did not answer authentication. This link reports "
+                        f"an MTU of {self.mtu}, which carries {self.mtu - 3} bytes "
+                        f"per write, so the 27 and 29 byte authentication frames "
+                        f"went out in pieces, which not every vehicle may accept. "
+                        f"If you connect through a Bluetooth proxy, try a local "
+                        f"adapter or a proxy that negotiates a larger MTU"
+                    ) from None
+                raise TimeoutError(
+                    "Vehicle did not answer authentication, with or without "
+                    "re-asserting the password first. The usual cause is a wrong "
+                    "pairing password: a frame the vehicle cannot authenticate is "
+                    "dropped silently rather than refused. Check the password "
+                    "under Configure, and that it was verified against a capture "
+                    "from this vehicle"
+                ) from None
+            _LOGGER.info(
+                "%s answered AUTH only after the password was re-asserted",
+                self.serial,
+            )
+        if auth.index != 1:
+            self.password = None  # force a fresh pairing next time
+            raise TimeoutError(
+                "Vehicle rejected authentication - the stored pairing is no longer "
+                "valid, reconnect and confirm pairing on the vehicle"
+            )
+        _LOGGER.debug("Authenticated successfully")
+
+    async def _set_password(
+        self,
+        pair_timeout: float,
+        on_wait_for_button: Callable[[], None] | None,
+        already_paired: bool = False,
+    ) -> None:
+        """Register a session password, waiting for the user to confirm."""
+        # The vehicle simply stores whatever we send, so a strong random value is
+        # both simpler and safer than reproducing the app's weak PRNG.
+        password = secrets.token_bytes(16)
+        deadline = asyncio.get_running_loop().time() + pair_timeout
+        notified = False
+        self._undecryptable = 0
+
+        while True:
+            # Until the user confirms on the vehicle, it may reply "pending" or
+            # not reply at all - so a timeout here is expected, not fatal. Keep
+            # asking until the deadline, as the official app does.
+            if not self.is_connected:
+                # The vehicle drops the link when it is not going to pair; writing
+                # on regardless only produces a confusing bleak error.
+                raise TimeoutError(
+                    "The vehicle closed the connection during pairing. It is most "
+                    "likely still linked to another client and refusing to pair"
+                )
+            try:
+                response = await self._request(
+                    self.ble_board, CMD_SET_PWD, 0, password, expect=CMD_SET_PWD, timeout=2.5
+                )
+                if response.index == 1:
+                    self.password = password
+                    _LOGGER.info("Pairing confirmed on the vehicle")
+                    return
+                _LOGGER.debug("SET_PWD pending (index %d)", response.index)
+            except TimeoutError:
+                if self._undecryptable:
+                    # The vehicle did answer, but encrypted with a key we do not
+                    # have - it is still bound to another client and is talking
+                    # to us with that client's password. Waiting cannot fix this.
+                    raise TimeoutError(
+                        "The vehicle answered the pairing request but encrypted "
+                        "its reply with a key we do not have, so it is still "
+                        "bound to another client. Either remove it from your "
+                        "account in the Segway-Ninebot app, or enter the "
+                        "existing pairing password in the integration options"
+                    ) from None
+                _LOGGER.debug("SET_PWD unanswered, still waiting for confirmation")
+
+            if not notified and not already_paired and on_wait_for_button is not None:
+                on_wait_for_button()
+                notified = True
+            if asyncio.get_running_loop().time() >= deadline:
+                if already_paired:
+                    # A vehicle that already holds someone else's password will
+                    # not take a new one, no matter how often the button is
+                    # pressed - so don't keep telling the user to press it.
+                    raise TimeoutError(
+                        "The vehicle refuses to register a new pairing because it "
+                        "is still linked to another client. Remove it from your "
+                        "account in the Segway-Ninebot app and try again, or enter "
+                        "the existing pairing password in the integration options"
+                    )
+                raise TimeoutError(
+                    "Pairing was not confirmed on the vehicle. Press its power "
+                    "button once while Home Assistant is connecting"
+                )
+            await asyncio.sleep(2)
+
+    # -- register access -------------------------------------------------------
+
+    async def read_register(self, board: int, index: int, length: int) -> bytes:
+        """Read ``length`` bytes from a register."""
+        response = await self._request(
+            board, CMD_READ, index, bytes([length]), expect=CMD_READ_RESP
+        )
+        return response.payload[:length]
+
+    async def write_register(
+        self, board: int, index: int, value: int, *, length: int = 2, acked: bool = True
+    ) -> bool:
+        """Write a little-endian value to a register and confirm it took.
+
+        The official app uses two write commands: 0x02, which the vehicle
+        acknowledges with 0x05, and 0x03, which it does not answer. Either way
+        it reads the register straight back, so we do the same and report whether
+        the value actually changed. A caller that cannot read a value back
+        (nothing to compare) still gets the acknowledgement.
+        """
+        payload = value.to_bytes(length, "little")
+        if acked:
+            await self._request(board, CMD_WRITE, index, payload, expect=CMD_WRITE_RESP)
+        else:
+            self._drain()
+            await self._send(self._frame(board, CMD_WRITE_NO_REPLY, index, payload))
+            await asyncio.sleep(0.2)
+        try:
+            readback = await self.read_register(board, index, length)
+        except Exception:  # noqa: BLE001 - some registers do not read back
+            return True
+        return int.from_bytes(readback[:length], "little") == value
+
+    # -- framing ---------------------------------------------------------------
+
+    async def _request(
+        self,
+        target: int,
+        command: int,
+        index: int,
+        payload: bytes,
+        *,
+        expect: int,
+        timeout: float = 3.0,
+    ) -> Frame:
+        """Send a frame and wait for the matching reply."""
+        self._drain()
+        await self._send(self._frame(target, command, index, payload))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            try:
+                frame = await asyncio.wait_for(
+                    self._queue.get(), timeout=max(0.1, deadline - loop.time())
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                break
+            if frame.command == expect:
+                return frame
+            _LOGGER.debug("Ignoring unexpected frame: %s", frame)
+
+        raise TimeoutError(
+            f"No response to command 0x{command:02X} index 0x{index:02X}"
+        )
+
+    def _frame(self, target: int, command: int, index: int, payload: bytes = b"") -> bytes:
+        return build_frame(target, command, index, payload, sync2=self._sync2)
+
+    async def _send(self, plaintext: bytes) -> None:
+        assert self.client is not None, "Must be connected first"
+        data = self.crypto.encrypt(plaintext)
+        self._recent_tx = [*self._recent_tx[-3:], data]
+        _LOGGER.debug(
+            "TX plain %s -> enc %s (%d bytes, %s)",
+            _loggable(plaintext),
+            data.hex().upper(),
+            len(data),
+            "with response" if self._write_with_response else "no response",
+        )
+        # A frame goes out as one ATT write whenever the link can carry it. The
+        # CBC-MAC covers the whole frame, and splitting one cost the entire
+        # handshake on every frame over 20 bytes - AUTH (27) and SET_PWD (29) -
+        # while PRE_COMM (13) kept working and made it look model-specific.
+        #
+        # A link stuck at the minimum MTU cannot carry those two at all: the
+        # write is cut to 20 bytes and the rest is lost. There pieces are the only
+        # way, and an E110SE behind an ESP32 proxy shows they can work: it held
+        # the 20 bytes it got and took 7 from the next write to reach the length
+        # in the header, so it assembles a frame across writes (#7).
+        #
+        # Gated on self.mtu, not client.mtu_size: that is None for BlueZ's
+        # placeholder 23, so a link that has not said how small it is still gets
+        # a single write.
+        size = self.mtu - 3 if self.mtu else len(data)
+        for start in range(0, len(data), size):
+            await self.client.write_gatt_char(
+                self._write_uuid,
+                data[start : start + size],
+                response=self._write_with_response,
+            )
+
+    def _drain(self) -> None:
+        while not self._queue.empty():
+            self._queue.get_nowait()
+
+    async def _on_notify(
+        self, sender: BleakGATTCharacteristic, data: bytearray
+    ) -> None:
+        """Reassemble notifications into whole frames and decrypt them."""
+        _LOGGER.debug(
+            "RX on %s: %s (%d bytes)",
+            getattr(sender, "uuid", "?"),
+            bytes(data).hex().upper(),
+            len(data),
+        )
+        self._rx_buffer += data
+
+        while True:
+            start = -1
+            for candidate in (bytes([SYNC1, 0xA5]), bytes([SYNC1, 0xB5])):
+                found = self._rx_buffer.find(candidate)
+                if found >= 0 and (start < 0 or found < start):
+                    start = found
+            if start < 0:
+                # Keep only a trailing partial sync byte.
+                self._rx_buffer = self._rx_buffer[-1:]
+                return
+            if start:
+                del self._rx_buffer[:start]
+            if len(self._rx_buffer) < 3:
+                return
+
+            # Encrypted frame = 7 header/plaintext bytes + payload + 6 byte tail.
+            total = self._rx_buffer[2] + 13
+            if len(self._rx_buffer) < total:
+                return
+
+            raw = bytes(self._rx_buffer[:total])
+            del self._rx_buffer[:total]
+
+            # An E110SE sends back the frames it takes in, ours included. With
+            # writes cut to 20 bytes that came back as those 20 and the first 7
+            # of our next frame (#7). Decrypting it would count as a reply we
+            # cannot read, which during pairing means "bound to another client".
+            # Skip it and resume right after it.
+            echo = self._echo_length(raw)
+            if echo:
+                self._rx_buffer[:0] = raw[echo:]
+                _LOGGER.debug("Ignoring the vehicle's echo of our own frame (%d bytes)", echo)
+                continue
+
+            plaintext, status = self.crypto.decrypt(raw)
+            if status != 0:
+                # Whatever this was, a frame may start inside it; resume there
+                # rather than drop it with the rest.
+                resync = _next_sync(raw, 2)
+                if resync is not None:
+                    self._rx_buffer[:0] = raw[resync:]
+                    raw = raw[:resync]
+                # A reply we cannot decrypt is indistinguishable from no reply at
+                # all unless we say so: -2 means the key is wrong, -3 a replay.
+                self._undecryptable += 1
+                _LOGGER.debug(
+                    "Reply we could not decrypt (status %d, %d bytes): %s",
+                    status,
+                    len(raw),
+                    raw.hex().upper(),
+                )
+                continue
+            frame = parse_frame(plaintext)
+            if frame is None:
+                _LOGGER.debug("Dropping malformed frame")
+                continue
+            if self._queue.full():
+                self._queue.get_nowait()
+            self._queue.put_nowait(frame)
+
+
+    def _echo_length(self, raw: bytes) -> int:
+        """How many leading bytes of ``raw`` echo a frame we just sent, or 0.
+
+        A whole frame sent back, or a cut-off start of one followed by the next
+        frame's sync bytes. Matching only a few header bytes would not do: the
+        header is the same for every frame of a length.
+        """
+        for sent in self._recent_tx:
+            common = 0
+            for ours, theirs in zip(sent, raw):
+                if ours != theirs:
+                    break
+                common += 1
+            if common == len(sent) or (
+                common >= 9 and raw[common : common + 2] in _SYNC_MARKERS
+            ):
+                return common
+        return 0
+
+
+_SYNC_MARKERS = (bytes([SYNC1, 0xA5]), bytes([SYNC1, 0xB5]))
+
+
+def _next_sync(data: bytes, start: int) -> int | None:
+    """Offset of the first sync marker at or after ``start``, if any."""
+    found = [i for i in (data.find(m, start) for m in _SYNC_MARKERS) if i >= 0]
+    return min(found) if found else None
+
+# --- Register map -----------------------------------------------------------
+# Register indexes are per board, and the boards differ by vehicle class, so a
+# single flat table cannot work: the E-series keeps its data on the dashboard,
+# kick scooters on the VCU, and the same index means different things on each.
+# Reading dashboard indexes out of a VCU is how "remaining range 1924.9 km" and
+# "current speed 1387.5 km/h" happened - those were the ASCII characters of the
+# vehicle identifier that a G3 keeps at 0x20-0x27.
+
+
+def _u16(data: bytes) -> int:
+    return struct.unpack("<H", data[:2])[0]
+
+
+def _u32(data: bytes) -> int:
+    return struct.unpack("<I", data[:4])[0]
+
+
+def _bit(bit: int) -> Callable[[bytes], int]:
+    """Read one flag out of the low byte of a status word."""
+    return lambda data: (data[0] >> bit) & 1
+
+
+_RIDE_MODES: dict[int, str] = {1: "walk", 2: "eco", 3: "sport", 5: "drive"}
+
+
+def _ride_mode(data: bytes) -> str | int:
+    """Name the ride mode, passing an unknown value through as the raw number."""
+    return _RIDE_MODES.get(data[0], data[0])
+
+
+_ENERGY_RECOVERY: dict[int, str] = {0: "off", 1: "low", 2: "standard"}
+
+
+def _energy_recovery(data: bytes) -> str | int:
+    """Name the energy recovery level, passing an unknown value through as is."""
+    return _ENERGY_RECOVERY.get(data[0], data[0])
+
+
+def _u16_unless_saturated(data: bytes) -> int | None:
+    """A 15-bit counter that stops at its ceiling rather than wrapping.
+
+    0x7FFF means "longer ago than this can count" (9 h 6 m), not a duration.
+    Reporting the ceiling as a number would have the scooter claim the charger
+    changed exactly 9 h 6 m ago for as long as nothing happens.
+    """
+    value = struct.unpack("<H", data[:2])[0]
+    return None if value >= 0x7FFF else value
+
+
+def _s16(data: bytes) -> int:
+    return struct.unpack("<h", data[:2])[0]
+
+
+def _cells(data: bytes) -> list[int]:
+    """The thirteen cell voltages in a 26-byte read, in mV."""
+    return [struct.unpack("<H", data[i : i + 2])[0] for i in range(0, 26, 2)]
+
+
+def _max_temp(data: bytes) -> int | None:
+    """The hottest pack sensor in degC, which is the number the app shows.
+
+    One byte per sensor, 0xFF where a pack does not have that one. None rather
+    than a zero when every byte is absent: 0 degC is a plausible-looking answer
+    and would be indistinguishable from a real reading.
+    """
+    temps = [b for b in data[:8] if b != 0xFF]
+    return max(temps) if temps else None
+
+
+@dataclass(frozen=True, kw_only=True)
+class V2Register:
+    """One readable value on a newer vehicle, on a specific board."""
+
+    key: str
+    index: int
+    length: int
+    unpack: Callable[[bytes], Any]
+    scale: float = 1.0
+    unit: str | None = None
+    device_class: str | None = None
+    primary: bool = False
+    # A yes/no flag, shown as a binary sensor; device_class is then a binary
+    # sensor class ("plug", "battery_charging").
+    binary: bool = False
+    # A fixed set of named states. The names are translation keys; any other
+    # value the unpacker passes through shows as unknown.
+    options: tuple[str, ...] | None = None
+
+
+# Kick scooters (Max G3 and relatives). Every entry here was confirmed by
+# predicting the value from the app's own display and then reading it back, so a
+# wrong guess would have shown up as a mismatch rather than being talked into
+# fitting. 0x45/0x47 used to sit here as "pack voltage" on the strength of one
+# reading that happened to look plausible; a discharge from 89 % to 46 % moved
+# the pack 52.9 V -> 47.6 V and left both registers at 5132, so they are static
+# and were removed. Registers 0x43-0x48 appear to be a constant block.
+V2_VCU_REGISTERS: tuple[V2Register, ...] = (
+    V2Register(
+        key="Battery",
+        index=0x55,
+        length=2,
+        unpack=_u16,
+        unit="%",
+        device_class="battery",
+        primary=True,
+    ),
+    # Read as u32: a u16 wraps at 6553.5 km, and 0x63 reads zero, which is what
+    # the high word of a u32 looks like at 1189 km.
+    V2Register(
+        key="Total mileage",
+        index=0x62,
+        length=4,
+        unpack=_u32,
+        scale=0.1,
+        unit="km",
+        device_class="distance",
+        primary=True,
+    ),
+    V2Register(
+        key="Remaining range",
+        index=0x5F,
+        length=2,
+        unpack=_u16,
+        scale=0.01,
+        unit="km",
+        device_class="distance",
+        primary=True,
+    ),
+    # The mode on the dashboard, switched with the button. Found on a Max G3 by
+    # reading every register in each of the four modes (#8): apart from the
+    # range estimates, only 0x5A followed. The numbers are what the scooter
+    # reports, not the dashboard's order. Read only - no capture shows the app
+    # writing it.
+    V2Register(
+        key="Ride mode",
+        index=0x5A,
+        length=2,
+        unpack=_ride_mode,
+        primary=True,
+        options=tuple(_RIDE_MODES.values()),
+    ),
+    # Both counters below tick once per second while the vehicle is AWAKE, not
+    # by wall clock: confirmed exactly, +5040 on each over 5040 s of a charge
+    # with the scooter continuously awake. An earlier reading that seemed to rule
+    # this out (+9 over 161 s) was taken across a sleep, where the vehicle only
+    # counted the seconds it spent serving the two polls.
+    V2Register(
+        key="Awake time",
+        index=0x64,
+        length=4,
+        unpack=_u32,
+        scale=1 / 3600,
+        unit="h",
+        device_class="duration",
+    ),
+    # Advances only while the wheels turn: unchanged across 84 minutes of awake
+    # charging, while the two counters above ticked every second. 3097 s over
+    # 25.1 km is a 29.2 km/h moving average, against 27.8 km/h lifetime.
+    V2Register(
+        key="Riding time",
+        index=0x66,
+        length=4,
+        unpack=_u32,
+        scale=1 / 3600,
+        unit="h",
+        device_class="duration",
+    ),
+    V2Register(
+        key="Temperature",
+        index=0x6B,
+        length=2,
+        unpack=_u16,
+        scale=0.1,
+        unit="\u00b0C",
+        device_class="temperature",
+    ),
+    # Two charger bits that are easy to mistake for each other, separated on an
+    # F3 by sweeping the board with the charger in and out and then re-reading
+    # at 100 %: 0x1F bit 6 follows the cable and stays set once the pack is
+    # full, 0x1C bit 2 follows the charge itself and clears at 100 %.
+    V2Register(
+        key="Charger connected",
+        index=0x1F,
+        length=2,
+        unpack=_bit(6),
+        device_class="plug",
+        primary=True,
+        binary=True,
+    ),
+    V2Register(
+        key="Charging",
+        index=0x1C,
+        length=2,
+        unpack=_bit(2),
+        device_class="battery_charging",
+        primary=True,
+        binary=True,
+    ),
+    # Not a current, though a 2276 looks like one: it climbed while the pack sat
+    # at 100 %, and its steps follow the wall clock rather than the charge
+    # (213 -> 257 over 44 s, 304 at +96 s). Plugging in and unplugging both
+    # reset it, so it counts from the last change of charger state either way.
+    V2Register(
+        key="Time since charger change",
+        index=0x69,
+        length=2,
+        unpack=_u16_unless_saturated,
+        unit="s",
+        device_class="duration",
+    ),
+    # Energy recovery: Off / Low / Standard in the app. Shipped as "Ride mode"
+    # until v0.18.1, from a reading on an F3 that matched the dashboard's
+    # E / D / S. On a Max G3 the app writes it from its energy recovery menu, in
+    # two captures, and writing it from Home Assistant left the dashboard mode
+    # where it was (#8). Off / Low / Standard match what the app shows after a
+    # change from Home Assistant, confirmed on that G3.
+    V2Register(
+        key="Energy recovery",
+        index=0x70,
+        length=2,
+        unpack=_energy_recovery,
+        options=tuple(_ENERGY_RECOVERY.values()),
+        primary=True,
+    ),
+)
+
+# Read on an F3 and deliberately left out of the table above.
+#
+# 0x47 = 5388, 0xC3 = 9624 and 0x1D = 6300 did not move across a full charge or
+# a ride. A constant with a plausible scale is how 0x45 went in as pack voltage,
+# so none of them earns a sensor on one reading.
+#
+# 0x43-0x48 read constant because they are settings rather than measurements:
+# two per-mode speed limits in km/h packed into each register, which is why 0x47
+# reads 5388 here and 5132 on a Max G3. 0x6E (1..3) and 0x42, the start speed, are
+# the same kind of thing. All are app-writable and belong in a control, not a
+# sensor.
+#
+# 0x6A is 1 only while the pack is taking charge and 0 at 100 % or just after
+# re-plugging - close enough to 0x1C bit 2 that one of the two must be misread,
+# and a single vehicle cannot say which. It stays out until a second one agrees.
+
+# Battery pack. On the newer protocol the pack is a second board behind the one
+# that serves vehicle data, and its index is model-specific. An F3 answers on
+# 0x07. A Max G3 was thought not to have one at all, because its owner scanned
+# 0x22 by hand and got nothing - but the probe finds a board there too and reads
+# the whole pack off it, which is a good argument for probing a list rather than
+# concluding anything from one address. So this is a candidate list - see
+# NinebotCoordinator._find_v2_bms_board(). It is deliberately not part of
+# _REGISTERS_BY_BOARD, which answers a different question: which single board
+# holds the vehicle's own data.
+V2_BMS_BOARDS: tuple[int, ...] = (0x07, 0x22, 0x23)
+
+# Confirmed on an F3 against the official app's Battery Details page: 0x5B and
+# 0x8C reproduced its 9480 mAh and 53.5 V exactly, and 0x8D moved with the
+# charge current. The first entry is what _find_v2_bms_board() probes with, so
+# keep pack voltage there - it is the one value every BMS has to serve.
+V2_BMS_REGISTERS: tuple[V2Register, ...] = (
+    V2Register(
+        key="Battery voltage",
+        index=0x8C,
+        length=2,
+        unpack=_u16,
+        scale=0.01,
+        unit="V",
+        device_class="voltage",
+        primary=True,
+    ),
+    # Signed: positive while charging, about -0.06 A sitting idle.
+    V2Register(
+        key="Battery current",
+        index=0x8D,
+        length=2,
+        unpack=_s16,
+        scale=0.01,
+        unit="A",
+        device_class="current",
+        primary=True,
+    ),
+    V2Register(
+        key="Remaining capacity",
+        index=0x5B,
+        length=2,
+        unpack=_u16,
+        scale=10,
+        unit="mAh",
+        primary=True,
+    ),
+    V2Register(
+        key="Full capacity",
+        index=0x13,
+        length=2,
+        unpack=_u16,
+        scale=10,
+        unit="mAh",
+    ),
+    # The pack's own state of charge, which need not agree with the vehicle's
+    # 0x55 - hence a separate name rather than a second "Battery".
+    V2Register(
+        key="State of charge",
+        index=0x8F,
+        length=2,
+        unpack=_u16,
+        unit="%",
+        device_class="battery",
+    ),
+    # The app's battery maintenance setting: 80..100 in steps of 5.
+    V2Register(
+        key="Charge limit",
+        index=0x82,
+        length=2,
+        unpack=_u16,
+        unit="%",
+    ),
+    # 0xF9 is [temperature u16, state of charge u8, state of health u8]. The
+    # first two duplicate registers above, so only the health byte is taken.
+    V2Register(
+        key="Battery health",
+        index=0xF9,
+        length=4,
+        unpack=lambda data: data[3],
+        unit="%",
+    ),
+    V2Register(
+        key="Battery temperature",
+        index=0x96,
+        length=16,
+        unpack=_max_temp,
+        unit="\u00b0C",
+        device_class="temperature",
+    ),
+    # Thirteen cell voltages arrive in one 26-byte read, reduced to the two
+    # numbers worth watching: the spread between them is how a failing cell
+    # shows up. This costs a second read of the same register, which is the
+    # price of one value per entry in this table.
+    V2Register(
+        key="Cell voltage min",
+        index=0xA0,
+        length=26,
+        unpack=lambda data: min(_cells(data)),
+        scale=0.001,
+        unit="V",
+        device_class="voltage",
+    ),
+    V2Register(
+        key="Cell voltage max",
+        index=0xA0,
+        length=26,
+        unpack=lambda data: max(_cells(data)),
+        scale=0.001,
+        unit="V",
+        device_class="voltage",
+    ),
+)
+
+# E-series mopeds, which proxy values through the dashboard. These indexes come
+# from the protocol documentation and are NOT confirmed on hardware.
+V2_DIS_REGISTERS: tuple[V2Register, ...] = (
+    V2Register(
+        key="Battery",
+        index=0xB5,
+        length=2,
+        unpack=_u16,
+        unit="%",
+        device_class="battery",
+        primary=True,
+    ),
+    V2Register(
+        key="Total mileage",
+        index=0xB7,
+        length=4,
+        unpack=_u32,
+        scale=0.001,
+        unit="km",
+        device_class="distance",
+        primary=True,
+    ),
+    V2Register(
+        key="Remaining range",
+        index=0x25,
+        length=2,
+        unpack=_u16,
+        scale=0.1,
+        unit="km",
+        device_class="distance",
+        primary=True,
+    ),
+    V2Register(
+        key="Trip mileage",
+        index=0xB9,
+        length=4,
+        unpack=_u32,
+        scale=0.001,
+        unit="km",
+        device_class="distance",
+    ),
+    V2Register(
+        key="Current speed",
+        index=0x26,
+        length=2,
+        unpack=_u16,
+        scale=0.1,
+        unit="km/h",
+    ),
+    V2Register(
+        key="Average speed",
+        index=0x27,
+        length=2,
+        unpack=_u16,
+        scale=0.1,
+        unit="km/h",
+    ),
+    V2Register(
+        key="Rated max speed",
+        index=0x48,
+        length=2,
+        unpack=_u16,
+        scale=0.1,
+        unit="km/h",
+    ),
+    V2Register(
+        key="Riding mode",
+        index=0x74,
+        length=2,
+        unpack=_u16,
+    ),
+)
+
+_REGISTERS_BY_BOARD: dict[int, tuple[V2Register, ...]] = {
+    BOARD_VCU: V2_VCU_REGISTERS,
+    BOARD_DIS: V2_DIS_REGISTERS,
+}
+
+
+def registers_for_board(board: int) -> tuple[V2Register, ...]:
+    """Return the register table belonging to a board, VCU being the default."""
+    return _REGISTERS_BY_BOARD.get(board, V2_VCU_REGISTERS)
+
+
+def binary_registers(board: int, bms_board: int | None = None) -> list[V2Register]:
+    """The yes/no registers for a vehicle, which become binary sensors."""
+    registers = registers_for_board(board)
+    if bms_board is not None:
+        registers = (*registers, *V2_BMS_REGISTERS)
+    return [reg for reg in registers if reg.binary]
+
+
+# --- Controls (newer protocol) ----------------------------------------------
+# Writable settings, each confirmed against a capture of the official app
+# changing it on a Max G3 (#8). Only settings whose register, value range and
+# effect are unambiguous are listed; anything whose purpose is unclear is left
+# out, because a wrong value in an unknown register is the one way to brick a
+# setting. "board" says which board the register lives on: the VCU, or the
+# battery pack (whose index is model-specific and probed, like the sensors).
+
+BOARD_KIND_VCU = "vcu"
+BOARD_KIND_BMS = "bms"
+
+
+@dataclass(frozen=True, kw_only=True)
+class V2NumberControl:
+    """A numeric setting exposed as a number entity."""
+
+    key: str
+    board: str
+    index: int
+    minimum: int
+    maximum: int
+    step: int = 1
+    unit: str | None = None
+    acked: bool = True
+    # Settings that affect how fast the scooter goes ship disabled, like the
+    # legacy speed-limit entity, and carry the same warning.
+    sensitive: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class V2SelectControl:
+    """A choice setting exposed as a select entity. ``options`` maps label->value."""
+
+    key: str
+    board: str
+    index: int
+    options: dict[str, int]
+    acked: bool = False
+    sensitive: bool = False
+    # Values the scooter may hold that this control never writes. Shown as they
+    # are rather than as "unknown".
+    shown_only: dict[str, int] = field(default_factory=dict)
+
+
+def control_data_key(control: V2NumberControl | V2SelectControl) -> str:
+    """Where a control's current value lives in the coordinator's data.
+
+    Kept apart from the sensor keys: "Energy recovery" and "Charge limit" are
+    both a sensor and a control, and sharing the key let the raw control value
+    overwrite the sensor's decoded one.
+    """
+    return f"ctl_{control.board}_{control.index:02X}"
+
+
+V2_NUMBER_CONTROLS: tuple[V2NumberControl, ...] = (
+    V2NumberControl(
+        key="Charge limit", board=BOARD_KIND_BMS, index=0x82,
+        minimum=80, maximum=100, step=5, unit="%",
+    ),
+    V2NumberControl(
+        key="Auto power-off", board=BOARD_KIND_VCU, index=0x49,
+        minimum=1, maximum=30, step=1, unit="min", acked=False,
+    ),
+    V2NumberControl(
+        key="Sound volume", board=BOARD_KIND_VCU, index=0x76,
+        minimum=5, maximum=100, step=1, unit="%", acked=False,
+    ),
+)
+
+V2_SELECT_CONTROLS: tuple[V2SelectControl, ...] = (
+    V2SelectControl(
+        key="Energy recovery", board=BOARD_KIND_VCU, index=0x70,
+        options={"off": 0, "low": 1, "standard": 2},
+    ),
+    V2SelectControl(
+        key="Start speed", board=BOARD_KIND_VCU, index=0x42,
+        options={"3_kmh": 3, "4_kmh": 4, "5_kmh": 5},
+        # What the app offers depends on the country: 3-5 on a German G3, while
+        # a Dutch one sits at 0 (#18) and an F3 reads 0-5. The integration cannot
+        # tell which it is talking to, so it writes only what all of them take.
+        shown_only={"0_kmh": 0, "1_kmh": 1, "2_kmh": 2},
+    ),
+    # What the leftmost handlebar button does. The values are not in the app's
+    # order; each was read back after choosing it in the app (#8).
+    V2SelectControl(
+        key="Custom button", board=BOARD_KIND_VCU, index=0x4A,
+        options={"hazard_lights": 6, "energy_recovery_level": 4, "boost": 7},
+    ),
+)
