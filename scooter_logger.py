@@ -160,24 +160,29 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
     if prev and odo - prev[0] > 0.05:
         distance = round(odo - prev[0], 1)
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
-        stamp = now
-        while con.execute("SELECT 1 FROM trips WHERE id = ?", (f"scooter-{stamp}",)).fetchone():
-            stamp += 1
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
-        trip = {
-            "id": f"scooter-{stamp}",
-            "started_at": now - (dt or 0),
-            "ended_at": now,
-            "distance_km": distance,
-            "riding_s": dt,
-            "battery_pct": battery,
-            "posted": 0 if distance >= min_km else -1,
-        }
-        con.execute(
-            "INSERT INTO trips VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct, :posted)",
-            trip,
-        )
+        trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km)
     con.commit()
+    return trip
+
+
+def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, postable) -> dict:
+    stamp = ended_at
+    while con.execute("SELECT 1 FROM trips WHERE id = ?", (f"scooter-{stamp}",)).fetchone():
+        stamp += 1
+    trip = {
+        "id": f"scooter-{stamp}",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "distance_km": distance_km,
+        "riding_s": riding_s,
+        "battery_pct": battery,
+        "posted": 0 if postable else -1,
+    }
+    con.execute(
+        "INSERT INTO trips VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct, :posted)",
+        trip,
+    )
     return trip
 
 
@@ -354,7 +359,23 @@ def cmd_trips(args, con):
         print("No trips logged yet.")
     for ended_at, km, riding_s, battery, posted in rows:
         when = datetime.fromtimestamp(ended_at).strftime("%Y-%m-%d %H:%M")
-        print(f"{when}  {fmt_trip(km, riding_s)}  (battery {battery}%)  [{STATUS.get(posted, posted)}]")
+        charge = f"  (battery {battery}%)" if battery is not None else ""
+        print(f"{when}  {fmt_trip(km, riding_s)}{charge}  [{STATUS.get(posted, posted)}]")
+
+
+def cmd_add(args, con):
+    """Log a ride the scooter couldn't be read for. It doesn't touch the odometer baseline."""
+    try:
+        start = datetime.fromisoformat(args.start)
+    except ValueError:
+        sys.exit('--start must look like "2026-11-13 14:44" or "2026-11-13T14:44-05:00"')
+    started_at = int(start.timestamp())
+    riding_s = round(args.minutes * 60)
+    km = round(args.miles * KM_PER_MI, 2)
+    trip = insert_trip(con, started_at, started_at + riding_s, km, riding_s, None, True)
+    con.commit()
+    print(f"Logged {trip['id']}: {fmt_trip(km, riding_s)}, started {datetime.fromtimestamp(started_at):%Y-%m-%d %H:%M} local")
+    post_pending(con)
 
 
 def cmd_post(con):
@@ -387,6 +408,11 @@ def main():
 
     sub.add_parser("post", help="retry posting trips the website hasn't received")
 
+    add = sub.add_parser("add", help="log and post a ride by hand, e.g. one from before the logger ran")
+    add.add_argument("--miles", type=float, required=True)
+    add.add_argument("--minutes", type=float, required=True)
+    add.add_argument("--start", required=True, help='start time, "2026-11-13 14:44" (local) or with an offset')
+
     args = p.parse_args()
     args.min_km = args.min_miles * KM_PER_MI
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -403,6 +429,8 @@ def main():
             cmd_trips(args, con)
         elif args.cmd == "post":
             cmd_post(con)
+        elif args.cmd == "add":
+            cmd_add(args, con)
         elif args.cmd == "read":
             asyncio.run(cmd_read(args, state, con))
         else:

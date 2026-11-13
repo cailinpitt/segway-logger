@@ -41,6 +41,7 @@ The key and the trip log are stored in `~/.segway-logger/`.
 .venv/bin/python scooter_logger.py read    # one reading
 .venv/bin/python scooter_logger.py watch   # run forever
 .venv/bin/python scooter_logger.py trips   # list trips
+.venv/bin/python scooter_logger.py add --miles 7.7 --minutes 38 --start "2026-11-13 14:44"   # a ride it missed
 ```
 
 Add `-v` to see the Bluetooth handshake when debugging.
