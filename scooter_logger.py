@@ -37,7 +37,7 @@ RETRY_SECONDS = 600
 # posted column: 1 posted, 0 waiting, -1 too short to post, -2 rejected by the website
 STATUS = {1: "posted", 0: "pending", -1: "too short", -2: "rejected"}
 REGISTERS = {reg.key: reg for reg in V2_VCU_REGISTERS}
-WANTED = ("Total mileage", "Riding time", "Battery", "Remaining range")
+WANTED = ("Total mileage", "Riding time", "Battery", "Remaining range", "Charger connected", "Time since charger change")
 
 log = logging.getLogger("segway")
 
@@ -124,6 +124,8 @@ def db_open(data_dir: Path) -> sqlite3.Connection:
             range_km REAL
         )"""
     )
+    add_column(con, "readings", "charger INTEGER")
+    add_column(con, "readings", "since_charger_s INTEGER")
     con.execute(
         """CREATE TABLE IF NOT EXISTS trips (
             id TEXT PRIMARY KEY,
@@ -135,7 +137,14 @@ def db_open(data_dir: Path) -> sqlite3.Connection:
             posted INTEGER NOT NULL DEFAULT 0
         )"""
     )
+    add_column(con, "trips", "battery_start INTEGER")
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     return con
+
+
+def add_column(con, table, column):
+    if column.split()[0] not in {row[1] for row in con.execute(f"PRAGMA table_info({table})")}:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
 
 
 def record(con: sqlite3.Connection, values: dict, min_km: float):
@@ -145,17 +154,22 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
     riding = values.get("Riding time")
     riding_s = round(riding * 3600) if riding is not None else None
     battery = round(values["Battery"]) if "Battery" in values else None
+    charger = values.get("Charger connected")
+    since_charger = values.get("Time since charger change")
     prev = con.execute(
-        "SELECT odometer_km, riding_s FROM readings ORDER BY rowid DESC LIMIT 1"
+        "SELECT odometer_km, riding_s, battery_pct, ts FROM readings ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     con.execute(
-        "INSERT INTO readings VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO readings (ts, odometer_km, riding_s, battery_pct, range_km, charger, since_charger_s)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             datetime.fromtimestamp(now).isoformat(timespec="seconds"),
             odo,
             riding_s,
             battery,
             values.get("Remaining range"),
+            None if charger is None else int(bool(charger)),
+            None if since_charger is None else round(since_charger),
         ),
     )
     trip = None
@@ -163,12 +177,25 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         distance = round(odo - prev[0], 1)
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
-        trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km)
+        start = battery_at_start(prev, now, battery, charger, since_charger)
+        trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start)
     con.commit()
     return trip
 
 
-def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, postable) -> dict:
+def battery_at_start(prev, now, battery, charger, since_charger):
+    """The last reading's battery, or 100% if the scooter was charged since then."""
+    _, _, prev_battery, prev_ts = prev
+    since_prev = now - datetime.fromisoformat(prev_ts).timestamp()
+    charged = (
+        bool(charger)
+        or (since_charger is not None and since_charger < since_prev)
+        or (battery is not None and prev_battery is not None and battery > prev_battery)
+    )
+    return 100 if charged else prev_battery
+
+
+def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, postable, battery_start=None) -> dict:
     stamp = ended_at
     while con.execute("SELECT 1 FROM trips WHERE id = ?", (f"scooter-{stamp}",)).fetchone():
         stamp += 1
@@ -180,28 +207,58 @@ def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, posta
         "riding_s": riding_s,
         "battery_pct": battery,
         "posted": 0 if postable else -1,
+        "battery_start": battery_start,
     }
     con.execute(
-        "INSERT INTO trips VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct, :posted)",
+        "INSERT INTO trips (id, started_at, ended_at, distance_km, riding_s, battery_pct, posted, battery_start)"
+        " VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct, :posted, :battery_start)",
         trip,
     )
     return trip
 
 
+class PostFailed(Exception):
+    pass
+
+
+def post_json(path: str, body: dict, token: str):
+    """POST to the moving Worker. Raises PostFailed to retry later, HTTPError 400 for a rejection."""
+    api = os.environ.get("MOVING_API", DEFAULT_API).rstrip("/")
+    request = urllib.request.Request(
+        f"{api}{path}",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "authorization": f"Bearer {token}",
+            "content-type": "application/json",
+            "user-agent": "segway-logger/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode(errors="replace")[:200]
+        if err.code == 400:
+            raise ValueError(detail) from err
+        raise PostFailed(f"HTTP {err.code}: {detail}") from err
+    except OSError as err:
+        raise PostFailed(str(err)) from err
+
+
 def post_pending(con: sqlite3.Connection):
-    """Send every trip the website hasn't received. Safe to repeat: the Worker upserts by id."""
+    """Send every trip the website hasn't received, then the odometer. Safe to repeat: the Worker upserts."""
     rows = con.execute(
-        "SELECT id, started_at, distance_km, riding_s FROM trips WHERE posted = 0 ORDER BY ended_at"
+        "SELECT id, started_at, distance_km, riding_s, battery_start, battery_pct FROM trips"
+        " WHERE posted = 0 ORDER BY ended_at"
     ).fetchall()
-    if not rows:
-        return
     token = os.environ.get("MOVING_ADMIN_TOKEN")
     if not token:
-        log.info("%d trip(s) waiting to post; set MOVING_ADMIN_TOKEN to publish them", len(rows))
+        if rows:
+            log.info("%d trip(s) waiting to post; set MOVING_ADMIN_TOKEN to publish them", len(rows))
         return
-    api = os.environ.get("MOVING_API", DEFAULT_API).rstrip("/")
 
-    for trip_id, started_at, km, riding_s in rows:
+    for trip_id, started_at, km, riding_s, battery_start, battery_end in rows:
         body = {
             "id": trip_id,
             "startedAt": started_at,
@@ -209,35 +266,49 @@ def post_pending(con: sqlite3.Connection):
             "distanceMi": round(km / KM_PER_MI, 2),
             "movingTime": riding_s or 0,
             "elapsedTime": riding_s or 0,
+            "batteryStart": battery_start,
+            "batteryEnd": battery_end if battery_start is not None else None,
         }
-        request = urllib.request.Request(
-            f"{api}/activities",
-            data=json.dumps(body).encode(),
-            method="POST",
-            headers={
-                "authorization": f"Bearer {token}",
-                "content-type": "application/json",
-                "user-agent": "segway-logger/1.0",
-            },
-        )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                response.read()
-        except urllib.error.HTTPError as err:
-            detail = err.read().decode(errors="replace")[:200]
-            if err.code == 400:
-                con.execute("UPDATE trips SET posted = -2 WHERE id = ?", (trip_id,))
-                con.commit()
-                log.warning("Website rejected %s: %s", trip_id, detail)
-                continue
-            log.warning("Posting %s failed (HTTP %s: %s); will retry", trip_id, err.code, detail)
-            return
-        except OSError as err:
+            post_json("/activities", body, token)
+        except ValueError as err:
+            con.execute("UPDATE trips SET posted = -2 WHERE id = ?", (trip_id,))
+            con.commit()
+            log.warning("Website rejected %s: %s", trip_id, err)
+            continue
+        except PostFailed as err:
             log.warning("Posting %s failed (%s); will retry", trip_id, err)
             return
         con.execute("UPDATE trips SET posted = 1 WHERE id = ?", (trip_id,))
         con.commit()
         log.info("Posted %s to the website", trip_id)
+
+    post_odometer(con, token)
+
+
+def post_odometer(con: sqlite3.Connection, token: str):
+    latest = con.execute(
+        "SELECT ts, odometer_km, riding_s FROM readings ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    if not latest:
+        return
+    ts, km, riding_s = latest
+    sent = con.execute("SELECT value FROM meta WHERE key = 'posted_odometer_km'").fetchone()
+    if sent and float(sent[0]) == km:
+        return
+    body = {
+        "odometerMi": round(km / KM_PER_MI, 1),
+        "ridingTime": riding_s or 0,
+        "readAt": int(datetime.fromisoformat(ts).timestamp()),
+    }
+    try:
+        post_json("/scooter", body, token)
+    except (ValueError, PostFailed) as err:
+        log.warning("Posting the odometer failed (%s); will retry", err)
+        return
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('posted_odometer_km', ?)", (str(km),))
+    con.commit()
+    log.info("Posted odometer %s to the website", fmt_km(km))
 
 
 def fmt_km(km: float) -> str:
@@ -349,12 +420,13 @@ def report(args, con, values):
     trip = record(con, values, args.min_km)
     battery = values.get("Battery")
     if trip:
-        log.info("Trip: %s, battery %s%%", fmt_trip(trip["distance_km"], trip["riding_s"]), battery)
+        drop = f"{trip['battery_start']}% -> {battery}%" if trip["battery_start"] is not None else f"{battery}%"
+        log.info("Trip: %s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), drop)
         if trip["posted"] == -1:
             log.info("Too short to post (under %.2f mi)", args.min_miles)
-        post_pending(con)
     else:
         log.info("No new distance (odometer %s, battery %s%%)", fmt_km(values["Total mileage"]), battery)
+    post_pending(con)
 
 
 async def cmd_watch(args, state: State, con):
@@ -378,14 +450,17 @@ async def cmd_watch(args, state: State, con):
 
 def cmd_trips(args, con):
     rows = con.execute(
-        "SELECT ended_at, distance_km, riding_s, battery_pct, posted FROM trips ORDER BY ended_at DESC LIMIT ?",
+        "SELECT ended_at, distance_km, riding_s, battery_start, battery_pct, posted FROM trips"
+        " ORDER BY ended_at DESC LIMIT ?",
         (args.limit,),
     ).fetchall()
     if not rows:
         print("No trips logged yet.")
-    for ended_at, km, riding_s, battery, posted in rows:
+    for ended_at, km, riding_s, start, battery, posted in rows:
         when = datetime.fromtimestamp(ended_at).strftime("%Y-%m-%d %H:%M")
-        charge = f"  (battery {battery}%)" if battery is not None else ""
+        charge = ""
+        if battery is not None:
+            charge = f"  (battery {start}% -> {battery}%)" if start is not None else f"  (battery {battery}%)"
         print(f"{when}  {fmt_trip(km, riding_s)}{charge}  [{STATUS.get(posted, posted)}]")
 
 

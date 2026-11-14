@@ -49,6 +49,8 @@ Add `-v` to see the Bluetooth handshake when debugging.
 - With `MOVING_ADMIN_TOKEN` set, each trip is posted to `moving.cailinpitt.com` and appears on `/timeline` and `/moving`. Trips under `--min-miles` (default 0.25) are logged but not posted. A failed post is retried every 10 minutes, and `post` retries by hand. `trips` shows whether each trip was posted.
 - Connecting to the scooter wakes it up, so `watch` reads it only once a day. Starting at 9 PM Eastern (`--at`, `--tz`), it looks for the scooter every 5 minutes (`--every`) for 3 hours (`--hours`). After one successful read it sleeps until the next night. If the scooter never shows up, that day's riding is counted the next night.
 - A "trip" is the distance ridden between two readings, so all of a day's rides post as one trip. A ride after the nightly read lands on the next day's trip.
+- Each trip carries the battery level at the previous reading and now. If the scooter was charged in between (the charger is plugged in, it was plugged or unplugged since the last read, or the battery went up), the start is recorded as 100%.
+- After each read the scooter's lifetime odometer is posted too, for the lifetime counter on `/moving`.
 - The scooter accepts one connection at a time. If the Segway app is connected, reads fail until it disconnects.
 
 ## Running on a Linux home server
