@@ -4,7 +4,7 @@
   pair --password HEX   save the Segway app's pairing password (recommended, keeps the app working)
   pair --button         register a new pairing by pressing the scooter's power button
   read                  connect once, print the current values and record them
-  watch                 run forever, logging a trip each time the odometer has moved
+  watch                 run forever, reading the scooter once a night and logging what it rode that day
   trips                 list logged trips
   post                  retry posting trips the website hasn't received yet
 
@@ -22,8 +22,9 @@ import time
 import urllib.error
 import urllib.request
 import warnings
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from bleak import BleakScanner
 
@@ -308,48 +309,71 @@ async def cmd_read(args, state: State, con):
     post_pending(con)
 
 
-async def cmd_watch(args, state: State, con):
-    require_paired(state)
-    target = state.data["target"]
-    seen = asyncio.Event()
-    found = {}
+def window(day, args, tz):
+    start = datetime.combine(day, args.at, tzinfo=tz)
+    return start, start + timedelta(hours=args.hours)
 
-    def on_adv(dev, adv):
-        if matches(dev, adv, target):
-            found["device"] = dev
-            seen.set()
 
-    log.info("Watching for %s", target)
-    last_read = None
-    while True:
-        if last_read is not None:
-            wait = args.cooldown * 60 - (time.monotonic() - last_read)
-            if wait > 0:
-                await asyncio.sleep(wait)
+def read_since(con, start: datetime) -> bool:
+    row = con.execute("SELECT ts FROM readings ORDER BY rowid DESC LIMIT 1").fetchone()
+    return bool(row) and datetime.fromisoformat(row[0]).astimezone() >= start
+
+
+async def sleep_until(when: datetime, con):
+    """Sleep in short steps against the wall clock, retrying failed posts along the way."""
+    while (left := (when - datetime.now(when.tzinfo)).total_seconds()) > 0:
+        await asyncio.sleep(min(left, RETRY_SECONDS))
         post_pending(con)
-        seen.clear()
-        async with BleakScanner(detection_callback=on_adv):
+
+
+async def read_tonight(args, state: State, con, end: datetime) -> bool:
+    target = state.data["target"]
+    while datetime.now(end.tzinfo) < end:
+        post_pending(con)
+        device = await find(target, args.timeout)
+        if device:
+            log.info("Scooter seen, reading")
             try:
-                await asyncio.wait_for(seen.wait(), timeout=RETRY_SECONDS)
-            except asyncio.TimeoutError:
-                continue
-        log.info("Scooter seen, reading")
-        try:
-            values = await session(state, found["device"], state.password)
-        except Exception as err:
-            log.warning("Read failed: %s", err)
-            await asyncio.sleep(20)
+                values = await session(state, device, state.password)
+            except Exception as err:
+                log.warning("Read failed: %s", err)
+            else:
+                report(args, con, values)
+                return True
+        retry = datetime.now(end.tzinfo) + timedelta(minutes=args.every)
+        await sleep_until(min(retry, end), con)
+    return False
+
+
+def report(args, con, values):
+    trip = record(con, values, args.min_km)
+    battery = values.get("Battery")
+    if trip:
+        log.info("Trip: %s, battery %s%%", fmt_trip(trip["distance_km"], trip["riding_s"]), battery)
+        if trip["posted"] == -1:
+            log.info("Too short to post (under %.2f mi)", args.min_miles)
+        post_pending(con)
+    else:
+        log.info("No new distance (odometer %s, battery %s%%)", fmt_km(values["Total mileage"]), battery)
+
+
+async def cmd_watch(args, state: State, con):
+    """Connecting wakes the scooter, so only try once a night, retrying until the window closes."""
+    require_paired(state)
+    tz = ZoneInfo(args.tz)
+    day = datetime.now(tz).date()
+    while True:
+        start, end = window(day, args, tz)
+        if datetime.now(tz) >= end or read_since(con, start):
+            day += timedelta(days=1)
             continue
-        last_read = time.monotonic()
-        trip = record(con, values, args.min_km)
-        battery = values.get("Battery")
-        if trip:
-            log.info("Trip: %s, battery %s%%", fmt_trip(trip["distance_km"], trip["riding_s"]), battery)
-            if trip["posted"] == -1:
-                log.info("Too short to post (under %.2f mi)", args.min_miles)
-            post_pending(con)
-        else:
-            log.info("No new distance (odometer %s, battery %s%%)", fmt_km(values["Total mileage"]), battery)
+        if datetime.now(tz) < start:
+            log.info("Next read at %s", start.strftime("%Y-%m-%d %H:%M %Z"))
+            await sleep_until(start, con)
+        log.info("Looking for %s until %s", state.data["target"], end.strftime("%H:%M %Z"))
+        if not await read_tonight(args, state, con, end):
+            log.info("Scooter not seen tonight; any rides will be counted tomorrow")
+        day += timedelta(days=1)
 
 
 def cmd_trips(args, con):
@@ -402,8 +426,11 @@ def main():
 
     sub.add_parser("read", help="read and record the current values once")
 
-    watch = sub.add_parser("watch", help="log trips whenever the scooter is seen")
-    watch.add_argument("--cooldown", type=float, default=5.0, help="minutes between reads (default 5)")
+    watch = sub.add_parser("watch", help="read the scooter once a night and log the day's riding")
+    watch.add_argument("--at", type=dtime.fromisoformat, default=dtime(21, 0), help="when to start looking (default 21:00)")
+    watch.add_argument("--tz", default="America/New_York", help="time zone for --at (default America/New_York)")
+    watch.add_argument("--hours", type=float, default=3.0, help="how long to keep looking (default 3)")
+    watch.add_argument("--every", type=float, default=5.0, help="minutes between attempts (default 5)")
 
     trips = sub.add_parser("trips", help="list logged trips")
     trips.add_argument("--limit", type=int, default=20)
