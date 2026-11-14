@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -346,6 +347,7 @@ async def cmd_watch(args, state: State, con):
             log.info("Trip: %s, battery %s%%", fmt_trip(trip["distance_km"], trip["riding_s"]), battery)
             if trip["posted"] == -1:
                 log.info("Too short to post (under %.2f mi)", args.min_miles)
+            post_pending(con)
         else:
             log.info("No new distance (odometer %s, battery %s%%)", fmt_km(values["Total mileage"]), battery)
 
@@ -415,6 +417,8 @@ def main():
 
     args = p.parse_args()
     args.min_km = args.min_miles * KM_PER_MI
+    # BlueZ reports a placeholder MTU on every connection; the library already handles it.
+    warnings.filterwarnings("ignore", message="Using default MTU value")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     if args.verbose:
         logging.getLogger("ninebot_v2").setLevel(logging.DEBUG)
