@@ -195,6 +195,8 @@ def db_open(data_dir: Path) -> sqlite3.Connection:
         )"""
     )
     add_column(con, "trips", "battery_start INTEGER")
+    add_column(con, "trips", "battery_end INTEGER")
+    add_column(con, "readings", "combined_pct INTEGER")
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     return con
 
@@ -214,11 +216,12 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
     charger = values.get("Charger connected")
     since_charger = values.get("Time since charger change")
     prev = con.execute(
-        "SELECT odometer_km, riding_s, battery_pct, ts FROM readings ORDER BY rowid DESC LIMIT 1"
+        "SELECT odometer_km, riding_s, combined_pct FROM readings ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
+    combined = combined_pct(values.get("snapshot"))
     con.execute(
-        "INSERT INTO readings (ts, odometer_km, riding_s, battery_pct, range_km, charger, since_charger_s, registers)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO readings (ts, odometer_km, riding_s, battery_pct, range_km, charger, since_charger_s, registers,"
+        " combined_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             datetime.fromtimestamp(now).isoformat(timespec="seconds"),
             odo,
@@ -228,6 +231,7 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
             None if charger is None else int(bool(charger)),
             None if since_charger is None else round(since_charger),
             json.dumps(values["snapshot"]) if values.get("snapshot") else None,
+            combined,
         ),
     )
     trip = None
@@ -235,25 +239,32 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         distance = round(odo - prev[0], 1)
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
-        start = battery_at_start(prev, battery)
-        trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start)
+        start, end = (prev[2], combined) if None not in (prev[2], combined) and combined <= prev[2] else (None, None)
+        trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start, end)
     con.commit()
     return trip
 
 
-def battery_at_start(prev, battery):
-    """The internal battery at the last reading, or None if it has since been recharged.
+def combined_pct(snapshot) -> int | None:
+    """Charge left across the internal and external batteries, by capacity.
 
-    Only the internal battery is visible. The external one recharges it, so this
-    is the internal drop, not everything the ride used.
+    The external battery recharges the internal one, so only the two together say
+    what a ride used. None unless both answered, so readings stay comparable.
     """
-    prev_battery = prev[2]
-    if battery is None or prev_battery is None or battery > prev_battery:
-        return None
-    return prev_battery
+    left = full = 0
+    for pack in ("Pack", "External"):
+        remaining = (snapshot or {}).get(f"{pack} Remaining capacity")
+        capacity = (snapshot or {}).get(f"{pack} Full capacity")
+        if remaining is None or not capacity:
+            return None
+        left += remaining
+        full += capacity
+    return round(100 * left / full)
 
 
-def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, postable, battery_start=None) -> dict:
+def insert_trip(
+    con, started_at, ended_at, distance_km, riding_s, battery, postable, battery_start=None, battery_end=None
+) -> dict:
     stamp = ended_at
     while con.execute("SELECT 1 FROM trips WHERE id = ?", (f"scooter-{stamp}",)).fetchone():
         stamp += 1
@@ -266,10 +277,12 @@ def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, posta
         "battery_pct": battery,
         "posted": 0 if postable else -1,
         "battery_start": battery_start,
+        "battery_end": battery_end,
     }
     con.execute(
-        "INSERT INTO trips (id, started_at, ended_at, distance_km, riding_s, battery_pct, posted, battery_start)"
-        " VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct, :posted, :battery_start)",
+        "INSERT INTO trips (id, started_at, ended_at, distance_km, riding_s, battery_pct, posted, battery_start,"
+        " battery_end) VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct, :posted,"
+        " :battery_start, :battery_end)",
         trip,
     )
     return trip
@@ -307,7 +320,7 @@ def post_json(path: str, body: dict, token: str):
 def post_pending(con: sqlite3.Connection):
     """Send every trip the website hasn't received, then the odometer. Safe to repeat: the Worker upserts."""
     rows = con.execute(
-        "SELECT id, started_at, distance_km, riding_s, battery_start, battery_pct FROM trips"
+        "SELECT id, started_at, distance_km, riding_s, battery_start, COALESCE(battery_end, battery_pct) FROM trips"
         " WHERE posted = 0 ORDER BY ended_at"
     ).fetchall()
     token = os.environ.get("MOVING_ADMIN_TOKEN")
@@ -482,7 +495,11 @@ def report(args, con, values):
     trip = record(con, values, args.min_km)
     battery = round(values["Battery"]) if "Battery" in values else None
     if trip:
-        drop = f"{trip['battery_start']}% -> {battery}%" if trip["battery_start"] is not None else f"{battery}%"
+        drop = (
+            f"{trip['battery_start']}% -> {trip['battery_end']}% (both batteries)"
+            if trip["battery_start"] is not None
+            else f"{battery}% internal"
+        )
         log.info("Trip: %s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), drop)
         if trip["posted"] == -1:
             log.info("Too short to post (under %.2f mi)", args.min_miles)
@@ -512,7 +529,7 @@ async def cmd_watch(args, state: State, con):
 
 def cmd_trips(args, con):
     rows = con.execute(
-        "SELECT ended_at, distance_km, riding_s, battery_start, battery_pct, posted FROM trips"
+        "SELECT ended_at, distance_km, riding_s, battery_start, COALESCE(battery_end, battery_pct), posted FROM trips"
         " ORDER BY ended_at DESC LIMIT ?",
         (args.limit,),
     ).fetchall()
