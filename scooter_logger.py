@@ -28,7 +28,13 @@ from zoneinfo import ZoneInfo
 
 from bleak import BleakScanner
 
-from ninebot_v2.protocol_v2 import BOARD_VCU, V2_VCU_REGISTERS, NinebotV2Client
+from ninebot_v2.protocol_v2 import (
+    BOARD_VCU,
+    V2_BMS_BOARDS,
+    V2_BMS_REGISTERS,
+    V2_VCU_REGISTERS,
+    NinebotV2Client,
+)
 
 KM_PER_MI = 1.609344
 DEFAULT_DIR = Path.home() / ".segway-logger"
@@ -87,6 +93,47 @@ async def read_values(client: NinebotV2Client) -> dict:
     return values
 
 
+def scaled(reg, raw: bytes):
+    value = reg.unpack(raw)
+    if isinstance(value, (int, float)) and reg.scale != 1:
+        value = round(value * reg.scale, 4)
+    return value
+
+
+async def read_board(client, board, registers, snapshot, prefix=""):
+    for reg in registers:
+        try:
+            snapshot[prefix + reg.key] = scaled(reg, await client.read_register(board, reg.index, reg.length))
+        except Exception as err:
+            log.debug("No %s%s: %s", prefix, reg.key, err)
+
+
+async def find_bms(client, state: State):
+    """The battery pack's board number varies by model, so try each candidate once and remember it."""
+    if state.data.get("bms_board"):
+        return state.data["bms_board"]
+    probe = V2_BMS_REGISTERS[0]
+    for board in V2_BMS_BOARDS:
+        try:
+            await client.read_register(board, probe.index, probe.length)
+        except Exception:
+            continue
+        state.data["bms_board"] = board
+        state.save()
+        return board
+    return None
+
+
+async def read_snapshot(client, state: State) -> dict:
+    """Every register the protocol knows, saved raw so later stats can be built from real readings."""
+    snapshot = {}
+    await read_board(client, BOARD_VCU, V2_VCU_REGISTERS, snapshot)
+    board = await find_bms(client, state)
+    if board is not None:
+        await read_board(client, board, V2_BMS_REGISTERS, snapshot, prefix="Pack ")
+    return snapshot
+
+
 async def session(state: State, device, password, pair_timeout=0.0, on_button=None) -> dict:
     """Connect, authenticate, read, disconnect. Persists anything the handshake learned."""
     client = NinebotV2Client(
@@ -102,7 +149,12 @@ async def session(state: State, device, password, pair_timeout=0.0, on_button=No
             ble_board=client.ble_board,
         )
         state.save()
-        return await read_values(client)
+        values = await read_values(client)
+        try:
+            values["snapshot"] = await read_snapshot(client, state)
+        except Exception as err:
+            log.warning("Could not read the full register set: %s", err)
+        return values
     finally:
         # A pairing confirmed on the scooter must be saved even if a later step fails,
         # or the scooter ends up holding a key nobody has.
@@ -126,6 +178,7 @@ def db_open(data_dir: Path) -> sqlite3.Connection:
     )
     add_column(con, "readings", "charger INTEGER")
     add_column(con, "readings", "since_charger_s INTEGER")
+    add_column(con, "readings", "registers TEXT")
     con.execute(
         """CREATE TABLE IF NOT EXISTS trips (
             id TEXT PRIMARY KEY,
@@ -160,8 +213,8 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         "SELECT odometer_km, riding_s, battery_pct, ts FROM readings ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     con.execute(
-        "INSERT INTO readings (ts, odometer_km, riding_s, battery_pct, range_km, charger, since_charger_s)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO readings (ts, odometer_km, riding_s, battery_pct, range_km, charger, since_charger_s, registers)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             datetime.fromtimestamp(now).isoformat(timespec="seconds"),
             odo,
@@ -170,6 +223,7 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
             values.get("Remaining range"),
             None if charger is None else int(bool(charger)),
             None if since_charger is None else round(since_charger),
+            json.dumps(values["snapshot"]) if values.get("snapshot") else None,
         ),
     )
     trip = None
@@ -330,6 +384,10 @@ def print_values(values: dict):
         print(f"Remaining range: {fmt_km(values['Remaining range'])}")
     if "Riding time" in values:
         print(f"Riding time:     {values['Riding time']:.1f} h (lifetime)")
+    if values.get("snapshot"):
+        print("\nAll registers:")
+        for key, value in values["snapshot"].items():
+            print(f"  {key + ':':27} {value}")
 
 
 async def cmd_pair(args, state: State):
@@ -418,7 +476,7 @@ async def read_tonight(args, state: State, con, end: datetime) -> bool:
 
 def report(args, con, values):
     trip = record(con, values, args.min_km)
-    battery = values.get("Battery")
+    battery = round(values["Battery"]) if "Battery" in values else None
     if trip:
         drop = f"{trip['battery_start']}% -> {battery}%" if trip["battery_start"] is not None else f"{battery}%"
         log.info("Trip: %s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), drop)
