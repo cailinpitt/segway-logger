@@ -231,22 +231,22 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         distance = round(odo - prev[0], 1)
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
-        start = battery_at_start(prev, now, battery, charger, since_charger)
+        start = battery_at_start(prev, battery)
         trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start)
     con.commit()
     return trip
 
 
-def battery_at_start(prev, now, battery, charger, since_charger):
-    """The last reading's battery, or 100% if the scooter was charged since then."""
-    _, _, prev_battery, prev_ts = prev
-    since_prev = now - datetime.fromisoformat(prev_ts).timestamp()
-    charged = (
-        bool(charger)
-        or (since_charger is not None and since_charger < since_prev)
-        or (battery is not None and prev_battery is not None and battery > prev_battery)
-    )
-    return 100 if charged else prev_battery
+def battery_at_start(prev, battery):
+    """The internal battery at the last reading, or None if it has since been recharged.
+
+    Only the internal battery is visible. The external one recharges it, so this
+    is the internal drop, not everything the ride used.
+    """
+    prev_battery = prev[2]
+    if battery is None or prev_battery is None or battery > prev_battery:
+        return None
+    return prev_battery
 
 
 def insert_trip(con, started_at, ended_at, distance_km, riding_s, battery, postable, battery_start=None) -> dict:
