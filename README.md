@@ -50,6 +50,7 @@ Add `-v` to see the Bluetooth handshake when debugging.
 - Connecting to the scooter wakes it up, so `watch` reads it only once a day. Starting at 9 PM Eastern (`--at`, `--tz`), it looks for the scooter every 5 minutes (`--every`) for 3 hours (`--hours`). After one successful read it sleeps until the next night. If the scooter never shows up, that day's riding is counted the next night.
 - A "trip" is the distance ridden between two readings, so all of a day's rides post as one trip. A ride after the nightly read lands on the next day's trip.
 - Each trip carries the battery level at the previous reading and now, combined across the internal battery and the external one (board `0x06`), weighted by capacity. The external battery recharges the internal one, so only the two together show what a ride used. A trip gets no figure if either battery didn't answer or the charge went up.
+- The same readings give each trip's energy in watt-hours: the drop in remaining capacity across both batteries at their nominal 46.8 V (13 cells). With the batteries' full capacity, posted alongside the odometer, the site shows Wh per mile and a full-charge range.
 - Each reading also saves every register the protocol knows, from the scooter and its battery pack, as JSON in `readings.registers`.
 - After each read the scooter's lifetime odometer is posted too, for the lifetime counter on `/moving`.
 - The scooter accepts one connection at a time. If the Segway app is connected, reads fail until it disconnects.
