@@ -40,6 +40,8 @@ KM_PER_MI = 1.609344
 DEFAULT_DIR = Path.home() / ".segway-logger"
 DEFAULT_API = "https://moving.cailinpitt.com"
 RETRY_SECONDS = 600
+# The add-on external battery, found by decoding the Segway app's traffic; the internal pack is 0x07.
+EXTERNAL_BOARD = 0x06
 # posted column: 1 posted, 0 waiting, -1 too short to post, -2 rejected by the website
 STATUS = {1: "posted", 0: "pending", -1: "too short", -2: "rejected"}
 REGISTERS = {reg.key: reg for reg in V2_VCU_REGISTERS}
@@ -113,7 +115,7 @@ async def find_bms(client, state: State):
     if state.data.get("bms_board"):
         return state.data["bms_board"]
     probe = V2_BMS_REGISTERS[0]
-    for board in V2_BMS_BOARDS:
+    for board in (b for b in V2_BMS_BOARDS if b != EXTERNAL_BOARD):
         try:
             await client.read_register(board, probe.index, probe.length)
         except Exception:
@@ -128,6 +130,8 @@ async def read_snapshot(client, state: State) -> dict:
     """Every register the protocol knows, saved raw so later stats can be built from real readings."""
     snapshot = {}
     await read_board(client, BOARD_VCU, V2_VCU_REGISTERS, snapshot)
+    # Read before anything that might time out: a failed read can stall the ones after it.
+    await read_board(client, EXTERNAL_BOARD, V2_BMS_REGISTERS, snapshot, prefix="External ")
     board = await find_bms(client, state)
     if board is not None:
         await read_board(client, board, V2_BMS_REGISTERS, snapshot, prefix="Pack ")
