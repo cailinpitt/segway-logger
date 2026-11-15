@@ -81,12 +81,21 @@ async def find(target: str, timeout: float):
     )
 
 
+async def read_register(client, board, reg) -> bytes:
+    """One retry: reads right after connecting sometimes go unanswered."""
+    try:
+        return await client.read_register(board, reg.index, reg.length)
+    except Exception:
+        await asyncio.sleep(0.5)
+        return await client.read_register(board, reg.index, reg.length)
+
+
 async def read_values(client: NinebotV2Client) -> dict:
     values = {}
     for key in WANTED:
         reg = REGISTERS[key]
         try:
-            raw = await client.read_register(BOARD_VCU, reg.index, reg.length)
+            raw = await read_register(client, BOARD_VCU, reg)
             values[key] = reg.unpack(raw) * reg.scale
         except Exception as err:
             log.debug("Could not read %s: %s", key, err)
@@ -105,7 +114,7 @@ def scaled(reg, raw: bytes):
 async def read_board(client, board, registers, snapshot, prefix=""):
     for reg in registers:
         try:
-            snapshot[prefix + reg.key] = scaled(reg, await client.read_register(board, reg.index, reg.length))
+            snapshot[prefix + reg.key] = scaled(reg, await read_register(client, board, reg))
         except Exception as err:
             log.debug("No %s%s: %s", prefix, reg.key, err)
 
