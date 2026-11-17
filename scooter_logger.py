@@ -113,12 +113,16 @@ def scaled(reg, raw: bytes):
     return value
 
 
-async def read_board(client, board, registers, snapshot, prefix=""):
+async def read_board(client, board, registers, snapshot, prefix="") -> int:
+    """Read what answers into snapshot; return how many registers didn't."""
+    missed = 0
     for reg in registers:
         try:
             snapshot[prefix + reg.key] = scaled(reg, await read_register(client, board, reg))
         except Exception as err:
+            missed += 1
             log.debug("No %s%s: %s", prefix, reg.key, err)
+    return missed
 
 
 async def find_bms(client, state: State):
@@ -137,15 +141,26 @@ async def find_bms(client, state: State):
     return None
 
 
+# What the battery figures need, read before anything else in case the link doesn't last.
+PACK_FIRST = ("Remaining capacity", "Full capacity", "State of charge")
+
+
 async def read_snapshot(client, state: State) -> dict:
     """Every register the protocol knows, saved raw so later stats can be built from real readings."""
     snapshot = {}
-    await read_board(client, BOARD_VCU, V2_VCU_REGISTERS, snapshot)
-    # Read before anything that might time out: a failed read can stall the ones after it.
-    await read_board(client, EXTERNAL_BOARD, V2_BMS_REGISTERS, snapshot, prefix="External ")
-    board = await find_bms(client, state)
-    if board is not None:
-        await read_board(client, board, V2_BMS_REGISTERS, snapshot, prefix="Pack ")
+    internal = await find_bms(client, state)
+    packs = [("Pack ", internal)] if internal is not None else []
+    packs.append(("External ", EXTERNAL_BOARD))
+    first = [r for r in V2_BMS_REGISTERS if r.key in PACK_FIRST]
+    rest = [r for r in V2_BMS_REGISTERS if r.key not in PACK_FIRST]
+    missed = 0
+    for prefix, board in packs:
+        missed += await read_board(client, board, first, snapshot, prefix)
+    missed += await read_board(client, BOARD_VCU, V2_VCU_REGISTERS, snapshot)
+    for prefix, board in packs:
+        missed += await read_board(client, board, rest, snapshot, prefix)
+    if missed:
+        log.info("%d register(s) didn't answer%s", missed, "" if charge(snapshot) else ", including battery capacity")
     return snapshot
 
 
@@ -500,6 +515,20 @@ async def sleep_until(when: datetime, con):
         post_pending(con)
 
 
+async def with_battery(state: State, device, values: dict) -> dict:
+    """If the battery capacity didn't answer, reconnect once for it; keep the first read otherwise."""
+    if charge(values.get("snapshot")):
+        return values
+    log.info("Battery capacity missing; reconnecting once for it")
+    await asyncio.sleep(10)
+    try:
+        again = await session(state, device, state.password)
+    except Exception as err:
+        log.warning("Second read failed: %s", err)
+        return values
+    return again if charge(again.get("snapshot")) else values
+
+
 async def read_tonight(args, state: State, con, end: datetime) -> bool:
     target = state.data["target"]
     while datetime.now(end.tzinfo) < end:
@@ -512,7 +541,7 @@ async def read_tonight(args, state: State, con, end: datetime) -> bool:
             except Exception as err:
                 log.warning("Read failed: %s", err)
             else:
-                report(args, con, values)
+                report(args, con, await with_battery(state, device, values))
                 return True
         retry = datetime.now(end.tzinfo) + timedelta(minutes=args.every)
         await sleep_until(min(retry, end), con)
