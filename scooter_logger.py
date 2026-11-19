@@ -296,10 +296,11 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         distance = round(odo - prev[0], 1)
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
-        start, end, energy = None, None, None
+        # The level left is always worth showing; the drop only when no charge came in between.
+        start, end, energy = None, combined, None
         before, after = charge(json.loads(prev[2]) if prev[2] else None), charge(values.get("snapshot"))
         if before and after and after[0] <= before[0]:
-            start, end = round(100 * before[0] / before[1]), combined
+            start = round(100 * before[0] / before[1])
             energy = round((before[0] - after[0]) / 1000 * NOMINAL_V) or None
         trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start, end, energy)
     con.commit()
@@ -391,7 +392,8 @@ def post_json(path: str, body: dict, token: str):
 def post_pending(con: sqlite3.Connection):
     """Send every trip the website hasn't received, then the odometer. Safe to repeat: the Worker upserts."""
     rows = con.execute(
-        "SELECT id, started_at, distance_km, riding_s, battery_start, COALESCE(battery_end, battery_pct), energy_wh"
+        "SELECT id, started_at, distance_km, riding_s, battery_start,"
+        " COALESCE(battery_end, CASE WHEN battery_start IS NOT NULL THEN battery_pct END), energy_wh"
         " FROM trips"
         " WHERE posted = 0 ORDER BY ended_at"
     ).fetchall()
@@ -410,7 +412,7 @@ def post_pending(con: sqlite3.Connection):
             "movingTime": riding_s or 0,
             "elapsedTime": riding_s or 0,
             "batteryStart": battery_start,
-            "batteryEnd": battery_end if battery_start is not None else None,
+            "batteryEnd": battery_end,
             # Held back: a day's drop includes standby use and the external battery
             # refilling the internal one, not just riding. Still logged locally.
             "energyWh": None,
@@ -586,11 +588,12 @@ def report(args, con, values):
     trip = record(con, values, args.min_km)
     battery = round(values["Battery"]) if "Battery" in values else None
     if trip:
-        drop = (
-            f"{trip['battery_start']}% -> {trip['battery_end']}% (both batteries), {trip['energy_wh']} Wh"
-            if trip["battery_start"] is not None
-            else f"{battery}% internal"
-        )
+        if trip["battery_start"] is not None:
+            drop = f"{trip['battery_start']}% -> {trip['battery_end']}% (both batteries), {trip['energy_wh']} Wh"
+        elif trip["battery_end"] is not None:
+            drop = f"{trip['battery_end']}% left, charged since the last reading"
+        else:
+            drop = "unknown"
         log.info("Trip: %s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), drop)
         if trip["posted"] == -1:
             log.info("Too short to post (under %.2f mi)", args.min_miles)
