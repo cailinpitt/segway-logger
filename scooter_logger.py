@@ -4,7 +4,7 @@
   pair --password HEX   save the Segway app's pairing password (recommended, keeps the app working)
   pair --button         register a new pairing by pressing the scooter's power button
   read                  connect once, print the current values and record them
-  watch                 run forever, reading the scooter once a night and logging what it rode that day
+  watch                 run forever, reading the scooter after each ride and once a night
   trips                 list logged trips
   post                  retry posting trips the website hasn't received yet
 
@@ -253,6 +253,7 @@ def db_open(data_dir: Path) -> sqlite3.Connection:
     add_column(con, "trips", "battery_start INTEGER")
     add_column(con, "trips", "battery_end INTEGER")
     add_column(con, "trips", "energy_wh INTEGER")
+    add_column(con, "trips", "elapsed_s INTEGER")
     add_column(con, "readings", "combined_pct INTEGER")
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     return con
@@ -263,8 +264,12 @@ def add_column(con, table, column):
         con.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
 
 
-def record(con: sqlite3.Connection, values: dict, min_km: float):
-    """Store a reading; return the trip if the odometer moved since the last one."""
+def record(con: sqlite3.Connection, values: dict, min_km: float, outing=None):
+    """Store a reading; return the trip if the odometer moved since the last one.
+
+    outing is (departed_at, arrived_at) when the scooter was seen leaving and coming
+    back, which gives the trip real times instead of an estimate.
+    """
     now = int(time.time())
     odo = round(values["Total mileage"], 1)
     riding = values.get("Riding time")
@@ -273,7 +278,7 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
     charger = values.get("Charger connected")
     since_charger = values.get("Time since charger change")
     prev = con.execute(
-        "SELECT odometer_km, riding_s, registers FROM readings ORDER BY rowid DESC LIMIT 1"
+        "SELECT odometer_km, riding_s, registers, ts FROM readings ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     combined = combined_pct(values.get("snapshot"))
     con.execute(
@@ -304,7 +309,14 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
                 before = (after[1], after[1])
             start = round(100 * before[0] / before[1])
             energy = round((before[0] - after[0]) / 1000 * NOMINAL_V) or None
-        trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start, end, energy)
+        started_at, ended_at, elapsed = now - (dt or 0), now, None
+        # Only an outing that began after the last reading describes this distance.
+        if outing and outing[0] >= datetime.fromisoformat(prev[3]).timestamp():
+            started_at, ended_at = outing
+            elapsed = ended_at - started_at
+        trip = insert_trip(
+            con, started_at, ended_at, distance, dt, battery, distance >= min_km, start, end, energy, elapsed
+        )
     con.commit()
     return trip
 
@@ -336,7 +348,7 @@ def combined_pct(snapshot) -> int | None:
 
 def insert_trip(
     con, started_at, ended_at, distance_km, riding_s, battery, postable,
-    battery_start=None, battery_end=None, energy_wh=None,
+    battery_start=None, battery_end=None, energy_wh=None, elapsed_s=None,
 ) -> dict:
     stamp = ended_at
     while con.execute("SELECT 1 FROM trips WHERE id = ?", (f"scooter-{stamp}",)).fetchone():
@@ -352,11 +364,12 @@ def insert_trip(
         "battery_start": battery_start,
         "battery_end": battery_end,
         "energy_wh": energy_wh,
+        "elapsed_s": elapsed_s,
     }
     con.execute(
         "INSERT INTO trips (id, started_at, ended_at, distance_km, riding_s, battery_pct, posted, battery_start,"
-        " battery_end, energy_wh) VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s, :battery_pct,"
-        " :posted, :battery_start, :battery_end, :energy_wh)",
+        " battery_end, energy_wh, elapsed_s) VALUES (:id, :started_at, :ended_at, :distance_km, :riding_s,"
+        " :battery_pct, :posted, :battery_start, :battery_end, :energy_wh, :elapsed_s)",
         trip,
     )
     return trip
@@ -395,7 +408,7 @@ def post_pending(con: sqlite3.Connection):
     """Send every trip the website hasn't received, then the odometer. Safe to repeat: the Worker upserts."""
     rows = con.execute(
         "SELECT id, started_at, distance_km, riding_s, battery_start,"
-        " COALESCE(battery_end, CASE WHEN battery_start IS NOT NULL THEN battery_pct END), energy_wh"
+        " COALESCE(battery_end, CASE WHEN battery_start IS NOT NULL THEN battery_pct END), energy_wh, elapsed_s"
         " FROM trips"
         " WHERE posted = 0 ORDER BY ended_at"
     ).fetchall()
@@ -405,14 +418,14 @@ def post_pending(con: sqlite3.Connection):
             log.info("%d trip(s) waiting to post; set MOVING_ADMIN_TOKEN to publish them", len(rows))
         return
 
-    for trip_id, started_at, km, riding_s, battery_start, battery_end, energy_wh in rows:
+    for trip_id, started_at, km, riding_s, battery_start, battery_end, energy_wh, elapsed_s in rows:
         body = {
             "id": trip_id,
             "startedAt": started_at,
             "startDate": datetime.fromtimestamp(started_at).date().isoformat(),
             "distanceMi": round(km / KM_PER_MI, 2),
             "movingTime": riding_s or 0,
-            "elapsedTime": riding_s or 0,
+            "elapsedTime": max(elapsed_s or 0, riding_s or 0),
             "batteryStart": battery_start,
             "batteryEnd": battery_end,
             # Held back: a day's drop includes standby use and the external battery
@@ -547,47 +560,169 @@ def read_since(con, start: datetime) -> bool:
     return bool(row) and datetime.fromisoformat(row[0]).astimezone() >= start
 
 
-async def sleep_until(when: datetime, con):
-    """Sleep in short steps against the wall clock, retrying failed posts along the way."""
-    while (left := (when - datetime.now(when.tzinfo)).total_seconds()) > 0:
-        await asyncio.sleep(min(left, RETRY_SECONDS))
-        post_pending(con)
-
-
-# Reads of a parked scooter often break off partway, so a read missing the battery
-# figures is retried at the next attempt and the two are merged.
+# Reads of a parked scooter can break off partway, so a read missing the battery
+# figures is retried and the attempts are merged.
 ATTEMPTS_FOR_BATTERY = 3
 
+# Presence, from the advertisements the scooter sends even while off. Seconds.
+TICK = 5
+AWAY_AFTER = 180  # silence that means it was rolled out, not a dropped advert
+SETTLE = 120  # back this long before reading, so it's parked rather than passing by
+SEEN_RECENTLY = 30
+ARRIVAL_RETRY = 120
+ARRIVAL_DEADLINE = 30 * 60
 
-async def read_tonight(args, state: State, con, end: datetime) -> bool:
-    target = state.data["target"]
-    values, attempts = None, 0
-    while datetime.now(end.tzinfo) < end:
-        post_pending(con)
-        device = await find(target, args.timeout)
-        if device:
-            log.info("Scooter seen, reading")
+
+class Presence:
+    """Tracks the scooter leaving range and coming back, without connecting to it."""
+
+    def __init__(self, target: str):
+        self.target = target
+        self.started = time.time()
+        self.device = None
+        self.last_seen = None
+        self.away = False
+        self.departed_at = None
+        self.back_since = None
+
+    def saw(self, dev, adv):
+        if matches(dev, adv, self.target):
+            self.device = dev
+            self.last_seen = time.time()
+
+    def update(self, now: float) -> str | None:
+        """Advance on the latest adverts; returns "left" or "back" when that changes."""
+        if self.last_seen is None:
+            if not self.away and now - self.started > AWAY_AFTER:
+                self.away = True  # away since before we started; departure time unknown
+            return None
+        silent = now - self.last_seen
+        if not self.away and silent > AWAY_AFTER:
+            self.away, self.departed_at, self.back_since = True, self.last_seen, None
+            return "left"
+        if self.away and silent < SEEN_RECENTLY and self.back_since is None:
+            self.back_since = self.last_seen
+            return "back"
+        if self.away and self.back_since is not None and silent > AWAY_AFTER:
+            self.back_since = None  # passed by without stopping
+        return None
+
+    def settled(self, now: float) -> bool:
+        return (
+            self.away
+            and self.back_since is not None
+            and now - self.back_since >= SETTLE
+            and self.recent(now)
+        )
+
+    def recent(self, now: float) -> bool:
+        return self.last_seen is not None and now - self.last_seen < SEEN_RECENTLY
+
+    def home(self):
+        self.away, self.departed_at, self.back_since = False, None, None
+
+
+class ReadJob:
+    """One reading, retried until the battery figures are complete or time runs out."""
+
+    def __init__(self, kind: str, retry: float, deadline: float, outing=None):
+        self.kind, self.retry, self.deadline, self.outing = kind, retry, deadline, outing
+        self.values, self.attempts, self.next_try = None, 0, 0.0
+
+    def due(self, now: float) -> bool:
+        return now >= self.next_try
+
+    def add(self, fresh: dict, now: float) -> bool:
+        """Merge a read in; True when it's good enough to record."""
+        self.attempts += 1
+        self.values = merge(self.values, fresh) if self.values else fresh
+        self.next_try = now + self.retry
+        return bool(charge(self.values["snapshot"])) or self.attempts >= ATTEMPTS_FOR_BATTERY
+
+
+def nightly_window(args, tz, now: datetime):
+    """Tonight's window if it's open now."""
+    for day in (now.date() - timedelta(days=1), now.date()):
+        start, end = window(day, args, tz)
+        if start <= now < end:
+            return start, end
+    return None
+
+
+async def cmd_watch(args, state: State, con):
+    """Read the scooter once each time it comes back from a ride, plus once a night.
+
+    Connecting wakes the scooter, so it's only read right after it was ridden (it's
+    awake anyway) and in the nightly window, which catches anything missed.
+    """
+    require_paired(state)
+    tz = ZoneInfo(args.tz)
+    presence = Presence(state.data["target"])
+    scanner = BleakScanner(detection_callback=presence.saw)
+    scanning = False
+    job = None
+    last_post = 0.0
+    log.info("Watching for %s; nightly read at %s %s", presence.target, args.at.strftime("%H:%M"), args.tz)
+
+    while True:
+        if not scanning:
             try:
-                fresh = await session(state, device, state.password)
+                await scanner.start()
+                scanning = True
+            except Exception as err:
+                log.warning("Could not start scanning: %s", err)
+        await asyncio.sleep(TICK)
+        now = time.time()
+
+        change = presence.update(now)
+        if change == "left":
+            log.info("Scooter left at %s", datetime.fromtimestamp(presence.departed_at).strftime("%H:%M"))
+        elif change == "back":
+            log.info("Scooter back at %s", datetime.fromtimestamp(presence.back_since).strftime("%H:%M"))
+
+        if presence.settled(now):
+            outing = (int(presence.departed_at), int(presence.back_since)) if presence.departed_at else None
+            if job is None:
+                job = ReadJob("arrival", ARRIVAL_RETRY, now + ARRIVAL_DEADLINE, outing)
+            elif job.outing is None:
+                job.outing = outing  # back during the nightly read: that read covers the outing
+            presence.home()
+        if job is None:
+            tonight = nightly_window(args, tz, datetime.now(tz))
+            if tonight and not read_since(con, tonight[0]):
+                job = ReadJob("nightly", args.every * 60, tonight[1].timestamp())
+                log.info("Nightly read; trying until %s", tonight[1].strftime("%H:%M %Z"))
+
+        if job and job.due(now) and presence.recent(now):
+            if scanning:
+                await scanner.stop()
+                scanning = False
+            log.info("Reading (%s)", job.kind)
+            try:
+                fresh = await session(state, presence.device, state.password)
             except Exception as err:
                 log.warning("Read failed: %s", err)
+                job.next_try = now + job.retry
             else:
-                attempts += 1
-                values = merge(values, fresh) if values else fresh
-                if charge(values["snapshot"]) or attempts >= ATTEMPTS_FOR_BATTERY:
-                    report(args, con, values)
-                    return True
-                log.info("Battery figures incomplete; trying again in %g min", args.every)
-        retry = datetime.now(end.tzinfo) + timedelta(minutes=args.every)
-        await sleep_until(min(retry, end), con)
-    if values:
-        report(args, con, values)
-        return True
-    return False
+                if job.add(fresh, time.time()):
+                    report(args, con, job.values, job.outing)
+                    job = None
+                else:
+                    log.info("Battery figures incomplete; trying again in %d min", job.retry // 60)
+        if job and now >= job.deadline:
+            if job.values:
+                report(args, con, job.values, job.outing)
+            else:
+                log.info("No %s read; any riding will be counted at the next one", job.kind)
+            job = None
+
+        if now - last_post >= RETRY_SECONDS:
+            post_pending(con)
+            last_post = now
 
 
-def report(args, con, values):
-    trip = record(con, values, args.min_km)
+def report(args, con, values, outing=None):
+    trip = record(con, values, args.min_km, outing)
     battery = round(values["Battery"]) if "Battery" in values else None
     if trip:
         if trip["battery_start"] is not None:
@@ -596,31 +731,15 @@ def report(args, con, values):
             drop = f"{trip['battery_end']}% left"
         else:
             drop = "unknown"
-        log.info("Trip: %s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), drop)
+        span = ""
+        if trip["elapsed_s"]:
+            span = f", out {datetime.fromtimestamp(trip['started_at']):%H:%M}-{datetime.fromtimestamp(trip['ended_at']):%H:%M}"
+        log.info("Trip: %s%s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), span, drop)
         if trip["posted"] == -1:
             log.info("Too short to post (under %.2f mi)", args.min_miles)
     else:
         log.info("No new distance (odometer %s, battery %s%%)", fmt_km(values["Total mileage"]), battery)
     post_pending(con)
-
-
-async def cmd_watch(args, state: State, con):
-    """Connecting wakes the scooter, so only try once a night, retrying until the window closes."""
-    require_paired(state)
-    tz = ZoneInfo(args.tz)
-    day = datetime.now(tz).date()
-    while True:
-        start, end = window(day, args, tz)
-        if datetime.now(tz) >= end or read_since(con, start):
-            day += timedelta(days=1)
-            continue
-        if datetime.now(tz) < start:
-            log.info("Next read at %s", start.strftime("%Y-%m-%d %H:%M %Z"))
-            await sleep_until(start, con)
-        log.info("Looking for %s until %s", state.data["target"], end.strftime("%H:%M %Z"))
-        if not await read_tonight(args, state, con, end):
-            log.info("Scooter not seen tonight; any rides will be counted tomorrow")
-        day += timedelta(days=1)
 
 
 def cmd_trips(args, con):
