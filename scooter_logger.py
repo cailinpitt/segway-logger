@@ -296,10 +296,12 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         distance = round(odo - prev[0], 1)
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
-        # The level left is always worth showing; the drop only when no charge came in between.
         start, end, energy = None, combined, None
         before, after = charge(json.loads(prev[2]) if prev[2] else None), charge(values.get("snapshot"))
-        if before and after and after[0] <= before[0]:
+        if before and after:
+            # A charge between readings is always to full on both batteries, so the ride started at 100%.
+            if after[0] > before[0]:
+                before = (after[1], after[1])
             start = round(100 * before[0] / before[1])
             energy = round((before[0] - after[0]) / 1000 * NOMINAL_V) or None
         trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start, end, energy)
@@ -591,7 +593,7 @@ def report(args, con, values):
         if trip["battery_start"] is not None:
             drop = f"{trip['battery_start']}% -> {trip['battery_end']}% (both batteries), {trip['energy_wh']} Wh"
         elif trip["battery_end"] is not None:
-            drop = f"{trip['battery_end']}% left, charged since the last reading"
+            drop = f"{trip['battery_end']}% left"
         else:
             drop = "unknown"
         log.info("Trip: %s, battery %s", fmt_trip(trip["distance_km"], trip["riding_s"]), drop)
