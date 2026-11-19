@@ -42,6 +42,10 @@ DEFAULT_API = "https://moving.cailinpitt.com"
 RETRY_SECONDS = 600
 # Both batteries are 13 cells in series; watt-hours are taken at their nominal voltage.
 NOMINAL_V = 13 * 3.6
+# Energy between two readings counts as the ride's only if the scooter spent at most
+# this long awake but not riding (stops mid-ride count). Charging, and the external
+# battery refilling the internal one, keep it awake for hours and drain it.
+MAX_IDLE_AWAKE_H = 1.5
 # The add-on external battery, found by decoding the Segway app's traffic; the internal pack is 0x07.
 EXTERNAL_BOARD = 0x06
 # posted column: 1 posted, 0 waiting, -1 too short to post, -2 rejected by the website
@@ -308,7 +312,9 @@ def record(con: sqlite3.Connection, values: dict, min_km: float, outing=None):
             if after[0] > before[0]:
                 before = (after[1], after[1])
             start = round(100 * before[0] / before[1])
-            energy = round((before[0] - after[0]) / 1000 * NOMINAL_V) or None
+            idle = idle_awake(json.loads(prev[2]) if prev[2] else None, values.get("snapshot"))
+            if idle is not None and idle <= MAX_IDLE_AWAKE_H:
+                energy = round((before[0] - after[0]) / 1000 * NOMINAL_V) or None
         started_at, ended_at, elapsed = now - (dt or 0), now, None
         # Only an outing that began after the last reading describes this distance.
         if outing and outing[0] >= datetime.fromisoformat(prev[3]).timestamp():
@@ -319,6 +325,14 @@ def record(con: sqlite3.Connection, values: dict, min_km: float, outing=None):
         )
     con.commit()
     return trip
+
+
+def idle_awake(before, after) -> float | None:
+    """Hours the scooter was awake but not riding between two readings, if both have the counters."""
+    keys = ("Awake time", "Riding time")
+    if not before or not after or any(before.get(k) is None or after.get(k) is None for k in keys):
+        return None
+    return (after["Awake time"] - before["Awake time"]) - (after["Riding time"] - before["Riding time"])
 
 
 def charge(snapshot) -> tuple[int, int] | None:
@@ -428,9 +442,7 @@ def post_pending(con: sqlite3.Connection):
             "elapsedTime": max(elapsed_s or 0, riding_s or 0),
             "batteryStart": battery_start,
             "batteryEnd": battery_end,
-            # Held back: a day's drop includes standby use and the external battery
-            # refilling the internal one, not just riding. Still logged locally.
-            "energyWh": None,
+            "energyWh": energy_wh,
         }
         try:
             post_json("/activities", body, token)
