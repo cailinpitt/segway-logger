@@ -83,13 +83,15 @@ async def find(target: str, timeout: float):
     )
 
 
-async def read_register(client, board, reg) -> bytes:
-    """One retry: reads right after connecting sometimes go unanswered."""
-    try:
-        return await client.read_register(board, reg.index, reg.length)
-    except Exception:
-        await asyncio.sleep(0.5)
-        return await client.read_register(board, reg.index, reg.length)
+async def read_register(client, board, reg, tries=3) -> bytes:
+    """Reads of a parked scooter sometimes go unanswered, so retry a couple of times."""
+    for attempt in range(tries):
+        try:
+            return await client.read_register(board, reg.index, reg.length)
+        except Exception:
+            if attempt == tries - 1:
+                raise
+            await asyncio.sleep(0.5)
 
 
 async def read_values(client: NinebotV2Client) -> dict:
@@ -164,6 +166,33 @@ async def read_snapshot(client, state: State) -> dict:
     return snapshot
 
 
+def fill_known(state: State, values: dict):
+    """Fill gaps with values that can't have changed or are read elsewhere.
+
+    Full capacity barely moves, so the last one read stands in. The vehicle's own
+    battery percent is the internal pack's state of charge.
+    """
+    snapshot = values.setdefault("snapshot", {})
+    known = state.data.setdefault("full_capacity", {})
+    for pack in ("Pack", "External"):
+        key = f"{pack} Full capacity"
+        if snapshot.get(key):
+            if known.get(pack) != snapshot[key]:
+                known[pack] = snapshot[key]
+                state.save()
+        elif known.get(pack):
+            snapshot[key] = known[pack]
+    if snapshot.get("Pack State of charge") is None and values.get("Battery") is not None:
+        snapshot["Pack State of charge"] = round(values["Battery"])
+
+
+def merge(first: dict, second: dict) -> dict:
+    """Two reads of the parked scooter, combined: the newer one wins where both answered."""
+    merged = {**first, **second}
+    merged["snapshot"] = {**first.get("snapshot", {}), **second.get("snapshot", {})}
+    return merged
+
+
 async def session(state: State, device, password, pair_timeout=0.0, on_button=None) -> dict:
     """Connect, authenticate, read, disconnect. Persists anything the handshake learned."""
     client = NinebotV2Client(
@@ -184,6 +213,7 @@ async def session(state: State, device, password, pair_timeout=0.0, on_button=No
             values["snapshot"] = await read_snapshot(client, state)
         except Exception as err:
             log.warning("Could not read the full register set: %s", err)
+        fill_known(state, values)
         return values
     finally:
         # A pairing confirmed on the scooter must be saved even if a later step fails,
@@ -243,7 +273,7 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
     charger = values.get("Charger connected")
     since_charger = values.get("Time since charger change")
     prev = con.execute(
-        "SELECT odometer_km, riding_s, combined_pct, registers FROM readings ORDER BY rowid DESC LIMIT 1"
+        "SELECT odometer_km, riding_s, registers FROM readings ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     combined = combined_pct(values.get("snapshot"))
     con.execute(
@@ -267,9 +297,9 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
         dt = riding_s - prev[1] if riding_s is not None and prev[1] is not None else None
         # The scooter keeps no trip start time; wheel time back from arrival is the best estimate.
         start, end, energy = None, None, None
-        before, after = charge(json.loads(prev[3]) if prev[3] else None), charge(values.get("snapshot"))
+        before, after = charge(json.loads(prev[2]) if prev[2] else None), charge(values.get("snapshot"))
         if before and after and after[0] <= before[0]:
-            start, end = prev[2], combined
+            start, end = round(100 * before[0] / before[1]), combined
             energy = round((before[0] - after[0]) / 1000 * NOMINAL_V) or None
         trip = insert_trip(con, now - (dt or 0), now, distance, dt, battery, distance >= min_km, start, end, energy)
     con.commit()
@@ -277,15 +307,18 @@ def record(con: sqlite3.Connection, values: dict, min_km: float):
 
 
 def charge(snapshot) -> tuple[int, int] | None:
-    """(remaining, full) mAh across the internal and external batteries, or None unless both answered.
+    """(remaining, full) mAh across the internal and external batteries, or None unless both are known.
 
     The external battery recharges the internal one, so only the two together say
-    what a ride used.
+    what a ride used. A missing remaining capacity falls back to state of charge.
     """
     left = full = 0
     for pack in ("Pack", "External"):
-        remaining = (snapshot or {}).get(f"{pack} Remaining capacity")
-        capacity = (snapshot or {}).get(f"{pack} Full capacity")
+        snap = snapshot or {}
+        capacity = snap.get(f"{pack} Full capacity")
+        remaining = snap.get(f"{pack} Remaining capacity")
+        if remaining is None and capacity and snap.get(f"{pack} State of charge") is not None:
+            remaining = round(snap[f"{pack} State of charge"] / 100 * capacity)
         if remaining is None or not capacity:
             return None
         left += remaining
@@ -378,7 +411,9 @@ def post_pending(con: sqlite3.Connection):
             "elapsedTime": riding_s or 0,
             "batteryStart": battery_start,
             "batteryEnd": battery_end if battery_start is not None else None,
-            "energyWh": energy_wh,
+            # Held back: a day's drop includes standby use and the external battery
+            # refilling the internal one, not just riding. Still logged locally.
+            "energyWh": None,
         }
         try:
             post_json("/activities", body, token)
@@ -515,36 +550,35 @@ async def sleep_until(when: datetime, con):
         post_pending(con)
 
 
-async def with_battery(state: State, device, values: dict) -> dict:
-    """If the battery capacity didn't answer, reconnect once for it; keep the first read otherwise."""
-    if charge(values.get("snapshot")):
-        return values
-    log.info("Battery capacity missing; reconnecting once for it")
-    await asyncio.sleep(10)
-    try:
-        again = await session(state, device, state.password)
-    except Exception as err:
-        log.warning("Second read failed: %s", err)
-        return values
-    return again if charge(again.get("snapshot")) else values
+# Reads of a parked scooter often break off partway, so a read missing the battery
+# figures is retried at the next attempt and the two are merged.
+ATTEMPTS_FOR_BATTERY = 3
 
 
 async def read_tonight(args, state: State, con, end: datetime) -> bool:
     target = state.data["target"]
+    values, attempts = None, 0
     while datetime.now(end.tzinfo) < end:
         post_pending(con)
         device = await find(target, args.timeout)
         if device:
             log.info("Scooter seen, reading")
             try:
-                values = await session(state, device, state.password)
+                fresh = await session(state, device, state.password)
             except Exception as err:
                 log.warning("Read failed: %s", err)
             else:
-                report(args, con, await with_battery(state, device, values))
-                return True
+                attempts += 1
+                values = merge(values, fresh) if values else fresh
+                if charge(values["snapshot"]) or attempts >= ATTEMPTS_FOR_BATTERY:
+                    report(args, con, values)
+                    return True
+                log.info("Battery figures incomplete; trying again in %g min", args.every)
         retry = datetime.now(end.tzinfo) + timedelta(minutes=args.every)
         await sleep_until(min(retry, end), con)
+    if values:
+        report(args, con, values)
+        return True
     return False
 
 
